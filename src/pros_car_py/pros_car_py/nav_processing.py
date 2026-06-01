@@ -19,10 +19,21 @@ class Nav2Processing:
         self.recordFlag = 0
         self.goal_published_flag = False
 
+        # Visual servoing state
+        self.camera_target_reached = False
+        self.camera_target_locked = False
+        self.camera_lost_count = 0
+        
+
     def reset_nav_process(self):
         self.finishFlag = False
         self.recordFlag = 0
         self.goal_published_flag = False
+
+        # Reset visual servoing state
+        self.camera_target_reached = False
+        self.camera_target_locked = False
+        self.camera_lost_count = 0
 
     def finish_nav_process(self):
         self.finishFlag = True
@@ -156,60 +167,141 @@ class Nav2Processing:
     def filter_negative_one(self, depth_list):
         return [depth for depth in depth_list if depth != -1.0]
 
+    # def camera_nav(self):
+    #     """
+    #     YOLO 目標資訊 (yolo_target_info) 說明：
+
+    #     - 索引 0 (index 0)：
+    #         - 表示是否成功偵測到目標
+    #         - 0：未偵測到目標
+    #         - 1：成功偵測到目標
+
+    #     - 索引 1 (index 1)：
+    #         - 目標的深度距離 (與相機的距離，單位為公尺)，如果沒偵測到目標就回傳 0
+    #         - 與目標過近時(大約 40 公分以內)會回傳 -1
+
+    #     - 索引 2 (index 2)：
+    #         - 目標相對於畫面正中心的像素偏移量
+    #         - 若目標位於畫面中心右側，數值為正
+    #         - 若目標位於畫面中心左側，數值為負
+    #         - 若沒有目標則回傳 0
+
+    #     畫面 n 個等分點深度 (camera_multi_depth) 說明 :
+
+    #     - 儲存相機畫面中央高度上 n 個等距水平點的深度值。
+    #     - 若距離過遠、過近（小於 40 公分）或是實體相機有時候深度會出一些問題，則該點的深度值將設定為 -1。
+    #     """
+    #     yolo_target_info = self.data_processor.get_yolo_target_info()
+    #     camera_multi_depth = self.data_processor.get_camera_x_multi_depth()
+    #     if camera_multi_depth == None or yolo_target_info == None:
+    #         return "STOP"
+
+    #     camera_forward_depth = self.filter_negative_one(camera_multi_depth[7:13])
+    #     camera_left_depth = self.filter_negative_one(camera_multi_depth[0:7])
+    #     camera_right_depth = self.filter_negative_one(camera_multi_depth[13:20])
+
+    #     action = "STOP"
+    #     limit_distance = 0.7
+
+    #     # if all(depth > limit_distance for depth in camera_forward_depth):
+    #     if yolo_target_info[0] == 1:
+    #         if yolo_target_info[2] > 200.0:
+    #             action = "CLOCKWISE_ROTATION_SLOW"
+    #         elif yolo_target_info[2] < -200.0:
+    #             action = "COUNTERCLOCKWISE_ROTATION_SLOW"
+    #         else:
+    #             if yolo_target_info[1] < 0.5:
+    #                 action = "STOP"
+    #             else:
+    #                 action = "FORWARD_SLOW"
+    #     else:
+    #         action = "CLOCKWISE_ROTATION"
+    #     # elif any(depth < limit_distance for depth in camera_left_depth):
+    #     #     action = "CLOCKWISE_ROTATION"
+    #     # elif any(depth < limit_distance for depth in camera_right_depth):
+    #     #     action = "COUNTERCLOCKWISE_ROTATION"
+    #     return action
+
     def camera_nav(self):
         """
-        YOLO 目標資訊 (yolo_target_info) 說明：
+        Visual servoing behavior.
 
-        - 索引 0 (index 0)：
-            - 表示是否成功偵測到目標
-            - 0：未偵測到目標
-            - 1：成功偵測到目標
+        /yolo/target_info:
+            index 0: found target, 1 = found, 0 = not found
+            index 1: target depth distance in meters
+            index 2: horizontal offset delta_x
 
-        - 索引 1 (index 1)：
-            - 目標的深度距離 (與相機的距離，單位為公尺)，如果沒偵測到目標就回傳 0
-            - 與目標過近時(大約 40 公分以內)會回傳 -1
-
-        - 索引 2 (index 2)：
-            - 目標相對於畫面正中心的像素偏移量
-            - 若目標位於畫面中心右側，數值為正
-            - 若目標位於畫面中心左側，數值為負
-            - 若沒有目標則回傳 0
-
-        畫面 n 個等分點深度 (camera_multi_depth) 說明 :
-
-        - 儲存相機畫面中央高度上 n 個等距水平點的深度值。
-        - 若距離過遠、過近（小於 40 公分）或是實體相機有時候深度會出一些問題，則該點的深度值將設定為 -1。
+        Behavior:
+            - If target has already been reached, keep stopping.
+            - If no target is found, rotate to search.
+            - If target is found but not centered, rotate slowly.
+            - If target is centered and far, move forward slowly.
+            - If target is close enough, latch target_reached and stop.
         """
         yolo_target_info = self.data_processor.get_yolo_target_info()
         camera_multi_depth = self.data_processor.get_camera_x_multi_depth()
-        if camera_multi_depth == None or yolo_target_info == None:
+
+        # Once reached, stay stopped until reset_nav_process() is called.
+        if self.camera_target_reached:
             return "STOP"
 
-        camera_forward_depth = self.filter_negative_one(camera_multi_depth[7:13])
-        camera_left_depth = self.filter_negative_one(camera_multi_depth[0:7])
-        camera_right_depth = self.filter_negative_one(camera_multi_depth[13:20])
+        if camera_multi_depth is None or yolo_target_info is None:
+            return "STOP"
 
-        action = "STOP"
-        limit_distance = 0.7
+        found = int(yolo_target_info[0])
+        distance = float(yolo_target_info[1])
+        delta_x = float(yolo_target_info[2])
 
-        # if all(depth > limit_distance for depth in camera_forward_depth):
-        if yolo_target_info[0] == 1:
-            if yolo_target_info[2] > 200.0:
-                action = "CLOCKWISE_ROTATION_SLOW"
-            elif yolo_target_info[2] < -200.0:
-                action = "COUNTERCLOCKWISE_ROTATION_SLOW"
-            else:
-                if yolo_target_info[1] < 0.5:
-                    action = "STOP"
-                else:
-                    action = "FORWARD_SLOW"
-        else:
-            action = "CLOCKWISE_ROTATION"
-        # elif any(depth < limit_distance for depth in camera_left_depth):
-        #     action = "CLOCKWISE_ROTATION"
-        # elif any(depth < limit_distance for depth in camera_right_depth):
-        #     action = "COUNTERCLOCKWISE_ROTATION"
-        return action
+        # Tunable parameters
+        x_threshold = 200.0
+        stop_distance = 0.5
+
+        # If target is not found, keep searching.
+        # Later, in the full mission state machine, this should switch back to exploration.
+        # if found != 1:
+        #     self.camera_lost_count += 1
+        #     return "CLOCKWISE_ROTATION"
+        max_lost_frames = 10
+
+        if found != 1:
+            if self.camera_target_locked:
+                self.camera_lost_count += 1
+
+                if self.camera_lost_count <= max_lost_frames:
+                    print(f"[camera_nav] Target temporarily lost: {self.camera_lost_count}/{max_lost_frames}. Stop and wait.")
+                    return "STOP"
+
+                print("[camera_nav] Target lost for too long. Unlock and search again.")
+                self.camera_target_locked = False
+                self.camera_lost_count = 0
+                return "CLOCKWISE_ROTATION"
+
+            return "CLOCKWISE_ROTATION"
+
+        # Target found, reset lost counter.
+        self.camera_target_locked = True
+        self.camera_lost_count = 0
+
+        # If depth is invalid because target is too close, stop and latch.
+        if distance == -1.0:
+            self.camera_target_reached = True
+            print("[camera_nav] Target reached: invalid/too-close depth. Stop.")
+            return "STOP"
+
+        # Rotate until target is aligned.
+        if delta_x > x_threshold:
+            return "CLOCKWISE_ROTATION_SLOW"
+        elif delta_x < -x_threshold:
+            return "COUNTERCLOCKWISE_ROTATION_SLOW"
+
+        # Target is aligned. Stop if close enough.
+        if distance < stop_distance:
+            self.camera_target_reached = True
+            print(f"[camera_nav] Target reached: distance={distance:.2f} m. Stop.")
+            return "STOP"
+
+        # Target is aligned but still far.
+        return "FORWARD_SLOW"
 
     def camera_nav_unity(self):
         """

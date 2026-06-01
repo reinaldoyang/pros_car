@@ -122,3 +122,8 @@ CATKIN_IGNORE
 video.txt
 *.prefab
 *.asset.meta
+
+# Ignore collected camera images
+src/pros_car_py/images/*.jpg
+src/pros_car_py/images/*.png
+src/pros_car_py/images/*.jpeg
