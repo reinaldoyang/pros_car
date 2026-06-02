@@ -23,6 +23,10 @@ class Nav2Processing:
         self.camera_target_reached = False
         self.camera_target_locked = False
         self.camera_lost_count = 0
+
+        # Mission-level state machine
+        self.mission_state = "INIT"
+        self.mission_bear_reached_announced = False
         
 
     def reset_nav_process(self):
@@ -30,10 +34,23 @@ class Nav2Processing:
         self.recordFlag = 0
         self.goal_published_flag = False
 
-        # Reset visual servoing state
+        self.reset_camera_nav_state()
+
+    def reset_camera_nav_state(self):
+        """Reset visual-servoing state used by camera_nav()."""
         self.camera_target_reached = False
         self.camera_target_locked = False
         self.camera_lost_count = 0
+
+    def reset_mission_state(self):
+        """Reset the mission state machine to its initial state."""
+        self.mission_state = "INIT"
+        self.mission_bear_reached_announced = False
+
+    def set_mission_state(self, next_state):
+        if self.mission_state != next_state:
+            print(f"[mission_nav] {self.mission_state} -> {next_state}")
+            self.mission_state = next_state
 
     def finish_nav_process(self):
         self.finishFlag = True
@@ -253,8 +270,8 @@ class Nav2Processing:
         delta_x = float(yolo_target_info[2])
 
         # Tunable parameters
-        x_threshold = 200.0
-        stop_distance = 0.5
+        x_threshold = 50.0
+        stop_distance = 0.45
 
         # If target is not found, keep searching.
         # Later, in the full mission state machine, this should switch back to exploration.
@@ -295,13 +312,71 @@ class Nav2Processing:
             return "COUNTERCLOCKWISE_ROTATION_SLOW"
 
         # Target is aligned. Stop if close enough.
-        if distance < stop_distance:
+        if distance <= stop_distance:
             self.camera_target_reached = True
             print(f"[camera_nav] Target reached: distance={distance:.2f} m. Stop.")
             return "STOP"
 
         # Target is aligned but still far.
         return "FORWARD_SLOW"
+
+    def mission_nav(self):
+        """
+        Mission-level navigation state machine.
+
+        Currently implemented:
+            INIT -> SEARCH_BEAR -> APPROACH_BEAR -> BEAR_REACHED
+
+        TODO placeholders:
+            GRASP_BEAR -> RETURN_HOME -> DROP_BEAR -> DONE
+        """
+        if self.mission_state == "INIT":
+            self.mission_bear_reached_announced = False
+            self.reset_camera_nav_state()
+            self.set_mission_state("SEARCH_BEAR")
+            return "STOP"
+
+        if self.mission_state == "SEARCH_BEAR":
+            yolo_target_info = self.data_processor.get_yolo_target_info()
+            if yolo_target_info is None:
+                return "CLOCKWISE_ROTATION"
+
+            found = int(yolo_target_info[0])
+            if found != 1:
+                return "CLOCKWISE_ROTATION"
+
+            self.set_mission_state("APPROACH_BEAR")
+            return self.camera_nav()
+
+        if self.mission_state == "APPROACH_BEAR":
+            action = self.camera_nav()
+            if self.camera_target_reached:
+                self.set_mission_state("BEAR_REACHED")
+                return "STOP"
+            return action
+
+        if self.mission_state == "BEAR_REACHED":
+            return "STOP"
+
+        if self.mission_state == "GRASP_BEAR":
+            # TODO: Trigger arm grasp sequence.
+            return "STOP"
+
+        if self.mission_state == "RETURN_HOME":
+            # TODO: Navigate back to the home/drop location.
+            return "STOP"
+
+        if self.mission_state == "DROP_BEAR":
+            # TODO: Trigger arm release/drop sequence.
+            return "STOP"
+
+        if self.mission_state == "DONE":
+            # TODO: Final mission-complete behavior.
+            return "STOP"
+
+        print(f"[mission_nav] Unknown state '{self.mission_state}'. Resetting mission.")
+        self.reset_mission_state()
+        return "STOP"
 
     def camera_nav_unity(self):
         """

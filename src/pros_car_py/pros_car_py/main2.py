@@ -30,8 +30,8 @@ def main():
     data_processor = DataProcessor(ros_communicator)
     nav2_processing = Nav2Processing(ros_communicator, data_processor)
     ik_solver = PybulletRobotController(end_eff_index=5)
-    car_controller = CarController(ros_communicator, nav2_processing)
     arm_controller = ArmController(ros_communicator, data_processor)
+    car_controller = CarController(ros_communicator, nav2_processing, arm_controller)
     crane_controller = CraneController(
         ros_communicator, data_processor, ik_solver, num_joints=7
     )

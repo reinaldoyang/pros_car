@@ -9,14 +9,17 @@ from datetime import datetime
 
 class CarController:
 
-    def __init__(self, ros_communicator, nav_processing):
+    def __init__(self, ros_communicator, nav_processing, arm_controller=None):
         self.ros_communicator = ros_communicator
         self.nav_processing = nav_processing
+        self.arm_controller = arm_controller
         # 用來管理後台執行緒的屬性
         self._auto_nav_thread = None
         self._stop_event = None
         self._thread_running = False
         self.flag = 0
+        self.mission_grasp_triggered = False
+        self._last_mission_log = None
 
         self._auto_nav_thread = None
         self._stop_event = threading.Event()
@@ -106,6 +109,10 @@ class CarController:
                 self._thread_running = False
 
             self.nav_processing.reset_nav_process()
+            if mode == "mission_nav":
+                self.nav_processing.reset_mission_state()
+                self.mission_grasp_triggered = False
+                self._last_mission_log = None
             action_key = "STOP"
             self.ros_communicator.publish_car_control(
                 action_key, publish_rear=True, publish_front=True
@@ -113,6 +120,10 @@ class CarController:
             return True
 
         if not self._thread_running:
+            if mode == "mission_nav":
+                self.nav_processing.reset_mission_state()
+                self.mission_grasp_triggered = False
+                self._last_mission_log = None
             self._stop_event.clear()  # 清除之前的停止狀態
             self._auto_nav_thread = threading.Thread(
                 target=self.background_task,
@@ -161,9 +172,33 @@ class CarController:
             elif mode == "custom_nav":
                 action_key = self.nav_processing.camera_nav()
 
+            elif mode == "mission_nav":
+                action_key = self.nav_processing.mission_nav()
+                if (
+                    self.nav_processing.mission_state == "BEAR_REACHED"
+                    and not self.mission_grasp_triggered
+                ):
+                    action_key = "STOP"
+                    self.nav_processing.set_mission_state("GRASP_BEAR")
+                    if self.arm_controller is None:
+                        print("[mission_nav] Cannot trigger grasp: arm_controller is None")
+                    else:
+                        print("[mission_nav] Triggering automatic arm grasp without clicked_point")
+                        self.arm_controller.trigger_auto_grasp_at_base()
+                    self.mission_grasp_triggered = True
+
             if self._thread_running == False:
                 action_key = "STOP"
-            print(action_key)
+            if mode == "mission_nav":
+                mission_log = (self.nav_processing.mission_state, action_key)
+                if mission_log != self._last_mission_log:
+                    print(
+                        f"[mission_nav] state={self.nav_processing.mission_state}, "
+                        f"action={action_key}"
+                    )
+                    self._last_mission_log = mission_log
+            else:
+                print(action_key)
             time.sleep(0.05)
             self.ros_communicator.publish_car_control(
                 action_key, publish_rear=True, publish_front=True
