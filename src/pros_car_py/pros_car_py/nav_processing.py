@@ -12,6 +12,7 @@ class Nav2Processing:
     def __init__(self, ros_communicator, data_processor):
         self.ros_communicator = ros_communicator
         self.data_processor = data_processor
+        self.arm_controller = None
         self.finishFlag = False
         self.global_plan_msg = None
         self.index = 0
@@ -23,10 +24,56 @@ class Nav2Processing:
         self.camera_target_reached = False
         self.camera_target_locked = False
         self.camera_lost_count = 0
+        self.camera_reached_count = 0
+        self.camera_required_reached_frames = 3
 
         # Mission-level state machine
         self.mission_state = "INIT"
         self.mission_bear_reached_announced = False
+        self.scan_start_yaw = None
+        self.scan_last_yaw = None
+        self.scan_accumulated_yaw = 0.0
+        self.scan_best_bear = None
+        self.scan_yaw_threshold = 90.0
+        self.scan_align_threshold = 10.0
+        self.scan_same_depth_margin = 0.05
+        self.home_pose = None
+        self.home_pose_warned = False
+        self.home_goal_published = False
+        self.home_distance_announced = False
+        self.home_align_announced = False
+        self.home_position_threshold = 0.18
+        self.home_yaw_threshold = 10.0
+        self.return_pose = [0.084, 0.028, 178.438]
+        self.return_goal_published = False
+        self.return_distance_announced = False
+        self.return_align_announced = False
+        self.return_position_threshold = 0.08
+        self.return_yaw_threshold = 10.0
+        self.return_home_goal_published = False
+        self.return_home_threshold = 0.35
+        self.drop_base_pose = [1.084, 4.067, -155.525]
+        self.drop_position_threshold = 0.12
+        self.drop_yaw_threshold = 8.0
+        self.drop_pose_goal_published = False
+        self.drop_pose_plan_warned = False
+        self.drop_pose_distance_announced = False
+        self.drop_pose_align_announced = False
+        self.drop_point = [2.1142576980666274, 4.0232925582173245, 0.0]
+        self.drop_staging_pose = None
+        self.drop_staging_threshold = 0.30
+        self.drop_staging_goal_published = False
+        self.post_grasp_forward_distance = 0.35
+        self.post_grasp_start_pose = None
+        self.post_grasp_forward_announced = False
+        self.gripper_forward_offset = 0.30
+        self.gripper_lateral_offset = 0.0
+        self.gripper_drop_threshold = 0.08
+        self.drop_align_threshold = 10.0
+        self.drop_align_announced = False
+        self.gripper_move_announced = False
+        self.drop_bear_triggered = False
+        self.arm_missing_warned = False
         
 
     def reset_nav_process(self):
@@ -41,11 +88,39 @@ class Nav2Processing:
         self.camera_target_reached = False
         self.camera_target_locked = False
         self.camera_lost_count = 0
+        self.camera_reached_count = 0
 
     def reset_mission_state(self):
         """Reset the mission state machine to its initial state."""
         self.mission_state = "INIT"
         self.mission_bear_reached_announced = False
+        self.reset_bear_scan_state()
+        self.home_pose = None
+        self.home_pose_warned = False
+        self.home_goal_published = False
+        self.home_distance_announced = False
+        self.home_align_announced = False
+        self.return_goal_published = False
+        self.return_distance_announced = False
+        self.return_align_announced = False
+        self.return_home_goal_published = False
+        self.drop_staging_pose = None
+        self.drop_staging_goal_published = False
+        self.drop_pose_goal_published = False
+        self.drop_pose_plan_warned = False
+        self.drop_pose_distance_announced = False
+        self.drop_pose_align_announced = False
+        self.post_grasp_start_pose = None
+        self.post_grasp_forward_announced = False
+        self.drop_align_announced = False
+        self.gripper_move_announced = False
+        self.drop_bear_triggered = False
+        self.arm_missing_warned = False
+        self.global_plan_msg = None
+        self.index = 0
+
+    def set_arm_controller(self, arm_controller):
+        self.arm_controller = arm_controller
 
     def set_mission_state(self, next_state):
         if self.mission_state != next_state:
@@ -144,6 +219,72 @@ class Nav2Processing:
         elif diff_angle > 20 and diff_angle < 180:
             action_key = "COUNTERCLOCKWISE_ROTATION"
         return action_key
+
+    def get_action_from_nav2_plan_tf_p_2_p(
+        self,
+        goal_coordinates=None,
+        finish_distance=0.5,
+        mark_finished=True,
+    ):
+        if goal_coordinates is not None and not self.goal_published_flag:
+            self.ros_communicator.publish_goal_pose(goal_coordinates)
+            self.goal_published_flag = True
+
+        current_pose = self.get_current_tf_pose_map()
+        goal_position = self.ros_communicator.get_latest_goal()
+        if current_pose is None or goal_position is None:
+            return "STOP"
+
+        # 只抓第一次路径
+        if self.recordFlag == 0:
+            global_plan_msg = (
+                self.data_processor.get_processed_received_global_plan_no_dynamic()
+            )
+            if global_plan_msg is None:
+                return "STOP"
+
+            print("Get first TF path")
+            self.index = 0
+            self.global_plan_msg = global_plan_msg
+            self.recordFlag = 1
+
+        if self.global_plan_msg is None:
+            return "STOP"
+
+        car_x = current_pose[0]
+        car_y = current_pose[1]
+        car_yaw = current_pose[2]
+        car_position = [car_x, car_y, 0.0]
+
+        goal_x = goal_position[0]
+        goal_y = goal_position[1]
+        target_distance = math.sqrt(
+            (car_x - goal_x) ** 2
+            + (car_y - goal_y) ** 2
+        )
+
+        if target_distance < finish_distance:
+            self.ros_communicator.reset_nav2()
+            if mark_finished:
+                self.finish_nav_process()
+            return "STOP"
+
+        target_x, target_y = self.get_next_target_point(car_position)
+        if target_x is None:
+            target_x = goal_x
+            target_y = goal_y
+
+        target_yaw = math.degrees(math.atan2(target_y - car_y, target_x - car_x)) % 360.0
+        diff_angle = self.angle_diff_deg(target_yaw, car_yaw)
+
+        if abs(diff_angle) < 20.0:
+            return "FORWARD"
+        if diff_angle < 0.0:
+            return "CLOCKWISE_ROTATION"
+        if diff_angle > 0.0:
+            return "COUNTERCLOCKWISE_ROTATION"
+
+        return "STOP"
 
     def check_data_availability(self):
         return (
@@ -271,7 +412,7 @@ class Nav2Processing:
 
         # Tunable parameters
         x_threshold = 50.0
-        stop_distance = 0.45
+        stop_distance = 0.4
 
         # If target is not found, keep searching.
         # Later, in the full mission state machine, this should switch back to exploration.
@@ -281,6 +422,7 @@ class Nav2Processing:
         max_lost_frames = 10
 
         if found != 1:
+            self.camera_reached_count = 0
             if self.camera_target_locked:
                 self.camera_lost_count += 1
 
@@ -299,54 +441,597 @@ class Nav2Processing:
         self.camera_target_locked = True
         self.camera_lost_count = 0
 
-        # If depth is invalid because target is too close, stop and latch.
-        if distance == -1.0:
-            self.camera_target_reached = True
-            print("[camera_nav] Target reached: invalid/too-close depth. Stop.")
-            return "STOP"
+        target_centered = abs(delta_x) <= x_threshold
+        valid_depth = distance > 0.0 and distance != -1.0
+        close_enough = valid_depth and distance <= stop_distance
+        invalid_depth = distance == -1.0
 
-        # Rotate until target is aligned.
-        if delta_x > x_threshold:
-            return "CLOCKWISE_ROTATION_SLOW"
-        elif delta_x < -x_threshold:
+        # If target is off-center, keep centering first. Never move forward while
+        # the bear is off-center, even when the reported depth is close/invalid.
+        if not target_centered:
+            self.camera_reached_count = 0
+            if delta_x > x_threshold:
+                return "CLOCKWISE_ROTATION_SLOW"
             return "COUNTERCLOCKWISE_ROTATION_SLOW"
 
-        # Target is aligned. Stop if close enough.
-        if distance <= stop_distance:
-            self.camera_target_reached = True
-            print(f"[camera_nav] Target reached: distance={distance:.2f} m. Stop.")
+        # Target is centered. Confirm close/reached over several frames before
+        # latching so one noisy depth frame does not end the approach too early.
+        if close_enough or invalid_depth:
+            self.camera_reached_count += 1
+            print(
+                "[camera_nav] Reached confirmation: "
+                f"{self.camera_reached_count}/{self.camera_required_reached_frames}, "
+                f"distance={distance:.2f}"
+            )
+
+            if self.camera_reached_count >= self.camera_required_reached_frames:
+                self.camera_target_reached = True
+                print(f"[camera_nav] Target reached confirmed: distance={distance:.2f} m. Stop.")
+
             return "STOP"
 
-        # Target is aligned but still far.
+        self.camera_reached_count = 0
+
+        # Target is centered but still far.
         return "FORWARD_SLOW"
+
+    def get_current_tf_yaw(self):
+        if not hasattr(self.ros_communicator, "get_tf_yaw"):
+            return None
+
+        return self.ros_communicator.get_tf_yaw(
+            parent_frame="odom",
+            child_frame="base_footprint",
+        )
+
+    def get_current_tf_pose_map(self):
+        if not hasattr(self.ros_communicator, "get_tf_pose"):
+            return None
+
+        return self.ros_communicator.get_tf_pose(
+            parent_frame="map",
+            child_frame="base_footprint",
+        )
+
+    def angle_diff_deg(self, target_yaw, current_yaw):
+        return (target_yaw - current_yaw + 180.0) % 360.0 - 180.0
+
+    def save_home_pose(self):
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            if not self.home_pose_warned:
+                print("[mission_nav] Cannot save home pose: TF map -> base_footprint unavailable")
+                self.home_pose_warned = True
+            return False
+
+        self.home_pose = current_pose
+        self.home_pose_warned = False
+        print(
+            "[mission_nav] Home pose saved: "
+            f"x={current_pose[0]:.3f}, y={current_pose[1]:.3f}, yaw={current_pose[2]:.3f}"
+        )
+        return True
+
+    def distance_to_home(self):
+        if self.home_pose is None:
+            return None
+
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return None
+
+        return math.sqrt(
+            (current_pose[0] - self.home_pose[0]) ** 2
+            + (current_pose[1] - self.home_pose[1]) ** 2
+        )
+
+    def get_action_to_return_home_pose(self):
+        if self.home_pose is None:
+            if not self.home_pose_warned:
+                print("[mission_nav] Cannot return home: home_pose is missing")
+                self.home_pose_warned = True
+            return "STOP"
+
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "STOP"
+
+        home_x, home_y, home_yaw = self.home_pose
+        distance = math.sqrt(
+            (current_pose[0] - home_x) ** 2
+            + (current_pose[1] - home_y) ** 2
+        )
+
+        if not self.home_distance_announced:
+            print(f"[mission_nav] Distance to home: {distance:.2f}")
+            self.home_distance_announced = True
+
+        if distance <= self.home_position_threshold:
+            self.ros_communicator.reset_nav2()
+            self.home_align_announced = False
+            self.set_mission_state("ALIGN_HOME_POSE")
+            return "STOP"
+
+        if not self.home_goal_published:
+            print(
+                "[mission_nav] Publishing saved home goal_pose: "
+                f"x={home_x:.3f}, y={home_y:.3f}, yaw={home_yaw:.3f}"
+            )
+            self.goal_published_flag = False
+            self.recordFlag = 0
+            self.global_plan_msg = None
+            self.index = 0
+            self.home_goal_published = True
+
+        return self.get_action_from_nav2_plan_tf_p_2_p(
+            goal_coordinates=self.home_pose,
+            finish_distance=self.home_position_threshold,
+        )
+
+    def get_action_to_align_home_pose(self):
+        if self.home_pose is None:
+            return "STOP"
+
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "STOP"
+
+        target_yaw = self.home_pose[2]
+        yaw_error = self.angle_diff_deg(target_yaw, current_pose[2])
+
+        if not self.home_align_announced:
+            print(
+                "[mission_nav] Aligning home yaw: "
+                f"target_yaw={target_yaw:.1f}, "
+                f"current_yaw={current_pose[2]:.1f}, "
+                f"error={yaw_error:.1f}"
+            )
+            self.home_align_announced = True
+
+        if abs(yaw_error) <= self.home_yaw_threshold:
+            self.set_mission_state("DONE")
+            return "STOP"
+
+        if yaw_error > 0:
+            return "COUNTERCLOCKWISE_ROTATION_SLOW"
+
+        return "CLOCKWISE_ROTATION_SLOW"
+
+    def get_action_to_return_fixed_pose(self):
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "STOP"
+
+        return_x, return_y, return_yaw = self.return_pose
+        distance = math.sqrt(
+            (current_pose[0] - return_x) ** 2
+            + (current_pose[1] - return_y) ** 2
+        )
+
+        if not self.return_distance_announced:
+            print(f"[mission_nav] Distance to fixed return pose: {distance:.2f}")
+            self.return_distance_announced = True
+
+        if distance <= self.return_position_threshold:
+            self.ros_communicator.reset_nav2()
+            self.return_align_announced = False
+            self.set_mission_state("ALIGN_FIXED_POSE")
+            return "STOP"
+
+        if not self.return_goal_published:
+            print(
+                "[mission_nav] Publishing fixed return goal: "
+                f"x={return_x:.3f}, y={return_y:.3f}, yaw={return_yaw:.3f}"
+            )
+            self.goal_published_flag = False
+            self.recordFlag = 0
+            self.global_plan_msg = None
+            self.index = 0
+            self.return_goal_published = True
+
+        return self.get_action_from_nav2_plan_tf_p_2_p(
+            goal_coordinates=self.return_pose,
+            finish_distance=self.return_position_threshold,
+            mark_finished=False,
+        )
+
+    def get_action_to_align_fixed_pose(self):
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "STOP"
+
+        target_yaw = self.return_pose[2]
+        yaw_error = self.angle_diff_deg(target_yaw, current_pose[2])
+
+        if not self.return_align_announced:
+            print(
+                "[mission_nav] Aligning fixed pose yaw: "
+                f"target_yaw={target_yaw:.1f}, "
+                f"current_yaw={current_pose[2]:.1f}, "
+                f"error={yaw_error:.1f}"
+            )
+            self.return_align_announced = True
+
+        if abs(yaw_error) <= self.return_yaw_threshold:
+            self.set_mission_state("DROP_BEAR")
+            return "STOP"
+
+        if yaw_error > 0:
+            return "COUNTERCLOCKWISE_ROTATION_SLOW"
+
+        return "CLOCKWISE_ROTATION_SLOW"
+
+    def calculate_diff_angle_from_tf_pose(self, current_pose, target_x, target_y):
+        target_yaw = math.degrees(
+            math.atan2(target_y - current_pose[1], target_x - current_pose[0])
+        ) % 360.0
+        return self.angle_diff_deg(target_yaw, current_pose[2])
+
+    def estimate_gripper_map_position(self, base_x, base_y, yaw_deg):
+        yaw_rad = math.radians(yaw_deg)
+        gripper_x = (
+            base_x
+            + math.cos(yaw_rad) * self.gripper_forward_offset
+            - math.sin(yaw_rad) * self.gripper_lateral_offset
+        )
+        gripper_y = (
+            base_y
+            + math.sin(yaw_rad) * self.gripper_forward_offset
+            + math.cos(yaw_rad) * self.gripper_lateral_offset
+        )
+        return gripper_x, gripper_y
+
+    def calculate_drop_staging_pose(self, current_pose):
+        drop_x, drop_y, _ = self.drop_point
+        target_yaw = math.degrees(
+            math.atan2(drop_y - current_pose[1], drop_x - current_pose[0])
+        ) % 360.0
+        yaw_rad = math.radians(target_yaw)
+        staging_x = (
+            drop_x
+            - math.cos(yaw_rad) * self.gripper_forward_offset
+            + math.sin(yaw_rad) * self.gripper_lateral_offset
+        )
+        staging_y = (
+            drop_y
+            - math.sin(yaw_rad) * self.gripper_forward_offset
+            - math.cos(yaw_rad) * self.gripper_lateral_offset
+        )
+        return [staging_x, staging_y, target_yaw]
+
+    def get_action_from_return_home_plan(self):
+        # Return-home navigation is disabled for the current bear mission.
+        return "STOP"
+
+    def get_action_to_move_forward_after_grasp(self):
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "STOP"
+
+        if self.post_grasp_start_pose is None:
+            self.post_grasp_start_pose = current_pose
+            if not self.post_grasp_forward_announced:
+                print(
+                    "[mission_nav] Moving forward after grasp: "
+                    f"target_distance={self.post_grasp_forward_distance:.2f}"
+                )
+                self.post_grasp_forward_announced = True
+            return "FORWARD_SLOW"
+
+        moved_distance = math.sqrt(
+            (current_pose[0] - self.post_grasp_start_pose[0]) ** 2
+            + (current_pose[1] - self.post_grasp_start_pose[1]) ** 2
+        )
+
+        if moved_distance < self.post_grasp_forward_distance:
+            return "FORWARD_SLOW"
+
+        self.drop_staging_goal_published = False
+        self.global_plan_msg = None
+        self.index = 0
+        self.drop_staging_pose = None
+        self.drop_align_announced = False
+        self.set_mission_state("ALIGN_DROP_POINT")
+        return "STOP"
+
+    def get_action_to_drop_staging_pose(self):
+        # Drop staging is disabled for the current mission.
+        return "STOP"
+
+    def get_action_to_nav_drop_pose(self):
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "STOP"
+
+        drop_x, drop_y, drop_yaw = self.drop_base_pose
+        distance = math.sqrt(
+            (current_pose[0] - drop_x) ** 2
+            + (current_pose[1] - drop_y) ** 2
+        )
+
+        if not self.drop_pose_distance_announced:
+            print(f"[mission_nav] Distance to drop pose: {distance:.2f}")
+            self.drop_pose_distance_announced = True
+
+        if distance <= self.drop_position_threshold:
+            self.ros_communicator.reset_nav2()
+            self.drop_pose_align_announced = False
+            self.set_mission_state("ALIGN_DROP_POSE")
+            return "STOP"
+
+        if not self.drop_pose_goal_published:
+            print(
+                "[mission_nav] Publishing fixed drop pose goal: "
+                f"x={drop_x:.3f}, y={drop_y:.3f}, yaw={drop_yaw:.3f}"
+            )
+            self.ros_communicator.publish_goal_pose(self.drop_base_pose)
+            self.drop_pose_goal_published = True
+            self.drop_pose_plan_warned = False
+            self.global_plan_msg = None
+            self.index = 0
+            return "STOP"
+
+        latest_plan = self.ros_communicator.latest_received_global_plan
+        if latest_plan is None or not latest_plan.poses:
+            if not self.drop_pose_plan_warned:
+                print("[mission_nav] Waiting for valid drop pose global plan.")
+                self.drop_pose_plan_warned = True
+            return "STOP"
+
+        final_position = latest_plan.poses[-1].pose.position
+        final_distance_to_drop = math.sqrt(
+            (final_position.x - drop_x) ** 2
+            + (final_position.y - drop_y) ** 2
+        )
+        if final_distance_to_drop > 0.5:
+            if not self.drop_pose_plan_warned:
+                print("[mission_nav] Drop pose global plan does not end near goal yet.")
+                self.drop_pose_plan_warned = True
+            return "STOP"
+
+        self.drop_pose_plan_warned = False
+        if self.global_plan_msg is None:
+            self.global_plan_msg = latest_plan
+            self.index = 0
+
+        target_x, target_y = self.get_next_target_point(current_pose)
+        if target_x is None:
+            return "STOP"
+
+        diff_angle = self.calculate_diff_angle_from_tf_pose(
+            current_pose,
+            target_x,
+            target_y,
+        )
+        if -20.0 < diff_angle < 20.0:
+            return "FORWARD"
+        if diff_angle < -20.0:
+            return "CLOCKWISE_ROTATION"
+        if diff_angle > 20.0:
+            return "COUNTERCLOCKWISE_ROTATION"
+
+        return "STOP"
+
+    def get_action_to_align_drop_pose(self):
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "STOP"
+
+        target_yaw = self.drop_base_pose[2]
+        yaw_error = self.angle_diff_deg(target_yaw, current_pose[2])
+
+        if not self.drop_pose_align_announced:
+            print(
+                "[mission_nav] Aligning to fixed drop yaw: "
+                f"target_yaw={target_yaw:.1f}, "
+                f"current_yaw={current_pose[2]:.1f}, "
+                f"error={yaw_error:.1f}"
+            )
+            self.drop_pose_align_announced = True
+
+        if abs(yaw_error) <= self.drop_yaw_threshold:
+            self.set_mission_state("DROP_BEAR")
+            return "STOP"
+
+        if yaw_error > 0:
+            return "COUNTERCLOCKWISE_ROTATION_SLOW"
+
+        return "CLOCKWISE_ROTATION_SLOW"
+
+    def get_action_to_align_drop_point(self):
+        # Drop-point heading is disabled for the fixed drop-pose mission.
+        return "STOP"
+
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "STOP"
+
+        drop_x, drop_y, _ = self.drop_point
+        target_yaw = math.degrees(
+            math.atan2(drop_y - current_pose[1], drop_x - current_pose[0])
+        ) % 360.0
+        yaw_error = self.angle_diff_deg(target_yaw, current_pose[2])
+
+        if not self.drop_align_announced:
+            print(
+                "[mission_nav] Aligning to drop point: "
+                f"target_yaw={target_yaw:.1f}, "
+                f"current_yaw={current_pose[2]:.1f}, "
+                f"error={yaw_error:.1f}"
+            )
+            self.drop_align_announced = True
+
+        if abs(yaw_error) <= self.drop_align_threshold:
+            self.gripper_move_announced = False
+            self.set_mission_state("DONE")
+            return "STOP"
+
+        if yaw_error > 0:
+            return "COUNTERCLOCKWISE_ROTATION_SLOW"
+
+        return "CLOCKWISE_ROTATION_SLOW"
+
+    def get_action_to_move_gripper_to_drop_point(self):
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "STOP"
+
+        base_x, base_y, current_yaw = current_pose
+        drop_x, drop_y, _ = self.drop_point
+        target_yaw = math.degrees(math.atan2(drop_y - base_y, drop_x - base_x)) % 360.0
+        yaw_error = self.angle_diff_deg(target_yaw, current_yaw)
+
+        if abs(yaw_error) > self.drop_align_threshold:
+            if yaw_error > 0:
+                return "COUNTERCLOCKWISE_ROTATION_SLOW"
+            return "CLOCKWISE_ROTATION_SLOW"
+
+        gripper_x, gripper_y = self.estimate_gripper_map_position(
+            base_x,
+            base_y,
+            current_yaw,
+        )
+        distance_to_drop = math.sqrt(
+            (gripper_x - drop_x) ** 2 + (gripper_y - drop_y) ** 2
+        )
+
+        if not self.gripper_move_announced:
+            print(
+                "[mission_nav] estimated gripper position: "
+                f"x={gripper_x:.2f}, y={gripper_y:.2f}, "
+                f"distance_to_drop={distance_to_drop:.2f}"
+            )
+            self.gripper_move_announced = True
+
+        if distance_to_drop <= self.gripper_drop_threshold:
+            print("[mission_nav] Gripper reached drop point")
+            self.set_mission_state("DONE")
+            return "STOP"
+
+        forward_error = (
+            (drop_x - gripper_x) * math.cos(math.radians(current_yaw))
+            + (drop_y - gripper_y) * math.sin(math.radians(current_yaw))
+        )
+
+        if forward_error > self.gripper_drop_threshold:
+            return "FORWARD_SLOW"
+        if forward_error < -self.gripper_drop_threshold:
+            return "BACKWARD_SLOW"
+
+        return "STOP"
+
+    def reset_bear_scan_state(self):
+        self.scan_start_yaw = None
+        self.scan_last_yaw = None
+        self.scan_accumulated_yaw = 0.0
+        self.scan_best_bear = None
+
+    def update_scan_accumulated_yaw(self, current_yaw):
+        if current_yaw is None:
+            return
+
+        if self.scan_start_yaw is None:
+            self.scan_start_yaw = current_yaw
+            self.scan_last_yaw = current_yaw
+            print(f"[mission_nav] scan started at yaw={current_yaw:.1f}")
+            return
+
+        if self.scan_last_yaw is None:
+            self.scan_last_yaw = current_yaw
+            return
+
+        yaw_step = abs(self.angle_diff_deg(current_yaw, self.scan_last_yaw))
+        self.scan_accumulated_yaw += yaw_step
+        self.scan_last_yaw = current_yaw
+
+    def update_scan_best_bear(self, distance, delta_x, current_yaw):
+        if current_yaw is None or distance <= 0.0 or distance == -1.0:
+            return
+
+        candidate = {
+            "distance": distance,
+            "delta_x": delta_x,
+            "yaw": current_yaw,
+        }
+
+        if self.scan_best_bear is None:
+            self.scan_best_bear = candidate
+            print(
+                "[mission_nav] best bear updated: "
+                f"distance={distance:.2f}, delta_x={delta_x:.1f}, yaw={current_yaw:.1f}"
+            )
+            return
+
+        best_distance = self.scan_best_bear["distance"]
+        best_delta_x = self.scan_best_bear["delta_x"]
+        closer = distance < best_distance - self.scan_same_depth_margin
+        more_centered_at_same_depth = (
+            abs(distance - best_distance) <= self.scan_same_depth_margin
+            and abs(delta_x) < abs(best_delta_x)
+        )
+
+        if closer or more_centered_at_same_depth:
+            self.scan_best_bear = candidate
+            print(
+                "[mission_nav] best bear updated: "
+                f"distance={distance:.2f}, delta_x={delta_x:.1f}, yaw={current_yaw:.1f}"
+            )
 
     def mission_nav(self):
         """
         Mission-level navigation state machine.
 
         Currently implemented:
-            INIT -> SEARCH_BEAR -> APPROACH_BEAR -> BEAR_REACHED
-
-        TODO placeholders:
-            GRASP_BEAR -> RETURN_HOME -> DROP_BEAR -> DONE
+            INIT -> SCAN_BEAR_90 -> ALIGN_BEST_BEAR
+                 -> APPROACH_BEAR -> BEAR_REACHED -> GRASP_BEAR
+                 -> RETURN_TO_FIXED_POSE -> ALIGN_FIXED_POSE -> DROP_BEAR -> DONE
         """
         if self.mission_state == "INIT":
             self.mission_bear_reached_announced = False
             self.reset_camera_nav_state()
-            self.set_mission_state("SEARCH_BEAR")
+            self.reset_bear_scan_state()
+            self.update_scan_accumulated_yaw(self.get_current_tf_yaw())
+            self.set_mission_state("SCAN_BEAR_90")
             return "STOP"
 
-        if self.mission_state == "SEARCH_BEAR":
+        if self.mission_state == "SCAN_BEAR_90":
+            current_yaw = self.get_current_tf_yaw()
+            self.update_scan_accumulated_yaw(current_yaw)
+
             yolo_target_info = self.data_processor.get_yolo_target_info()
-            if yolo_target_info is None:
-                return "CLOCKWISE_ROTATION"
+            if yolo_target_info is not None:
+                found = int(yolo_target_info[0])
+                distance = float(yolo_target_info[1])
+                delta_x = float(yolo_target_info[2])
+                if found == 1:
+                    self.update_scan_best_bear(distance, delta_x, current_yaw)
 
-            found = int(yolo_target_info[0])
-            if found != 1:
-                return "CLOCKWISE_ROTATION"
+            if self.scan_accumulated_yaw < self.scan_yaw_threshold:
+                return "COUNTERCLOCKWISE_ROTATION_SLOW"
 
-            self.set_mission_state("APPROACH_BEAR")
-            return self.camera_nav()
+            print("[mission_nav] 90-degree scan complete")
+            if self.scan_best_bear is None:
+                self.reset_bear_scan_state()
+                return "COUNTERCLOCKWISE_ROTATION_SLOW"
+
+            self.set_mission_state("ALIGN_BEST_BEAR")
+            return "STOP"
+
+        if self.mission_state == "ALIGN_BEST_BEAR":
+            current_yaw = self.get_current_tf_yaw()
+            if current_yaw is None or self.scan_best_bear is None:
+                return "STOP"
+
+            yaw_error = self.angle_diff_deg(self.scan_best_bear["yaw"], current_yaw)
+            if abs(yaw_error) <= self.scan_align_threshold:
+                self.reset_camera_nav_state()
+                self.set_mission_state("APPROACH_BEAR")
+                return self.camera_nav()
+
+            if yaw_error > 0:
+                return "COUNTERCLOCKWISE_ROTATION_SLOW"
+
+            return "CLOCKWISE_ROTATION_SLOW"
 
         if self.mission_state == "APPROACH_BEAR":
             action = self.camera_nav()
@@ -359,19 +1044,83 @@ class Nav2Processing:
             return "STOP"
 
         if self.mission_state == "GRASP_BEAR":
-            # TODO: Trigger arm grasp sequence.
+            if self.arm_controller is None:
+                if not self.arm_missing_warned:
+                    print("[mission_nav] Cannot monitor grasp: arm_controller is None")
+                    self.arm_missing_warned = True
+                return "STOP"
+
+            if self.arm_controller.grasp_done:
+                self.global_plan_msg = None
+                self.index = 0
+                self.goal_published_flag = False
+                self.recordFlag = 0
+                self.return_goal_published = False
+                self.return_distance_announced = False
+                self.return_align_announced = False
+                self.set_mission_state("RETURN_TO_FIXED_POSE")
+                return "STOP"
+
+            return "STOP"
+
+        if self.mission_state == "RETURN_TO_FIXED_POSE":
+            return self.get_action_to_return_fixed_pose()
+
+        if self.mission_state == "ALIGN_FIXED_POSE":
+            return self.get_action_to_align_fixed_pose()
+
+        if self.mission_state == "RETURN_TO_HOME_POSE":
+            # Disabled: mission uses a fixed return pose for now.
+            return "STOP"
+
+        if self.mission_state == "ALIGN_HOME_POSE":
+            # Disabled: mission uses a fixed return pose for now.
+            return "STOP"
+
+        if self.mission_state == "NAV_TO_DROP_POSE":
+            # Disabled: mission holds the bear after grasping.
+            return "STOP"
+
+        if self.mission_state == "ALIGN_DROP_POSE":
+            # Disabled: mission holds the bear after grasping.
+            return "STOP"
+
+        if self.mission_state == "MOVE_FORWARD_AFTER_GRASP":
+            # Disabled: mission holds the bear after grasping.
+            return "STOP"
+
+        if self.mission_state == "NAV_TO_STAGING_POSE":
+            # Disabled: do not publish a staging goal or move toward the drop point.
+            return "STOP"
+
+        if self.mission_state == "ALIGN_DROP_POINT":
+            # Disabled: mission holds the bear after grasping.
+            return "STOP"
+
+        if self.mission_state == "MOVE_GRIPPER_TO_DROP_POINT":
+            # Disabled: after alignment, stay stopped.
             return "STOP"
 
         if self.mission_state == "RETURN_HOME":
-            # TODO: Navigate back to the home/drop location.
+            # Return-home navigation is disabled for this mission step.
             return "STOP"
 
         if self.mission_state == "DROP_BEAR":
-            # TODO: Trigger arm release/drop sequence.
+            if not self.drop_bear_triggered:
+                print("[mission_nav] Dropping bear")
+                if self.arm_controller is None:
+                    if not self.arm_missing_warned:
+                        print("[mission_nav] Cannot drop bear: arm_controller is None")
+                        self.arm_missing_warned = True
+                elif hasattr(self.arm_controller, "release_bear"):
+                    self.arm_controller.release_bear()
+                else:
+                    self.arm_controller.manual_control(0, "b")
+                self.drop_bear_triggered = True
+                self.set_mission_state("DONE")
             return "STOP"
 
         if self.mission_state == "DONE":
-            # TODO: Final mission-complete behavior.
             return "STOP"
 
         print(f"[mission_nav] Unknown state '{self.mission_state}'. Resetting mission.")

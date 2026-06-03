@@ -21,6 +21,11 @@ class ArmController:
         self.ros_communicator = ros_communicator
         self.data_processor = data_processor
         self.target_marker = None
+        self.default_grasp_x = 0.174
+        self.default_grasp_z = -0.075
+        self.grasp_in_progress = False
+        self.grasp_done = False
+        self.release_done = False
         
         # 建立 TF2 監聽器 (使用 ros_communicator 作為 Node)
         self.tf_buffer = tf2_ros.Buffer()
@@ -47,16 +52,24 @@ class ArmController:
     # ==========================================
     # 2. 手動控制邏輯 (Manual Control)
     # ==========================================
+    def reset_to_initial_pose(self):
+        self.joint_angles = [joint["init"] for joint in self.joint_limits]
+        self._clamp_and_publish()
+        self._visualize_arm_lines()
+        print("手臂已重置為初始角度。")
+
+    def release_bear(self):
+        self.release_done = False
+        self.reset_to_initial_pose()
+        self.release_done = True
+        print("[mission_nav] Bear released / gripper opened.")
+
     def manual_control(self, index, key):
         """處理手動按鍵輸入，並根據 index 控制特定關節"""
         
         # 處理不依賴 index 的全域指令 ('b', 'q')
         if key == "b":  
-            # 🌟 重置手臂：讀取 __init__ 裡面設定的 init 初始角度
-            self.joint_angles = [joint["init"] for joint in self.joint_limits]
-            self._clamp_and_publish()
-            self._visualize_arm_lines()
-            print("手臂已重置為初始角度。")
+            self.reset_to_initial_pose()
             return False
             
         elif key == "q":  
@@ -97,11 +110,7 @@ class ArmController:
             self.target_marker = None
             return
         elif key == "b":  
-            # 🌟 重置手臂：讀取 __init__ 裡面設定的 init 初始角度
-            self.joint_angles = [joint["init"] for joint in self.joint_limits]
-            self._clamp_and_publish()
-            self._visualize_arm_lines()
-            print("手臂已重置為初始角度。")
+            self.reset_to_initial_pose()
             return
         else :
             print(f"按鍵 '{key}' 無效，請使用 'g'(抓取), 'b'(重置), 或 'q'(取消)。")
@@ -129,14 +138,45 @@ class ArmController:
 
             # 🌟 4. 開啟背景執行緒，執行「抓取與緩慢歸位」的完整排程
             # 使用 daemon=True 確保程式關閉時執行緒會自動結束
-            threading.Thread(
-                target=self._execute_grab_sequence, 
-                args=(x_target, z_target), 
-                daemon=True
-            ).start()
+            self.start_grab_sequence(x_target, z_target)
 
         except Exception as e:
             print(f"⚠️ 座標轉換或 TF 失敗: {e}")
+
+    def trigger_auto_grasp_at_base(self, x_target=None, z_target=None):
+        """Trigger the existing grasp sequence using arm_ik_base coordinates."""
+        if x_target is None:
+            x_target = self.default_grasp_x
+        if z_target is None:
+            z_target = self.default_grasp_z
+
+        print(
+            "[auto_grasp] Triggering grasp at arm_ik_base "
+            f"X={x_target:.3f}, Z={z_target:.3f}"
+        )
+        self.start_grab_sequence(x_target, z_target)
+
+    def start_grab_sequence(self, x_target, z_target):
+        self.grasp_in_progress = True
+        self.grasp_done = False
+        self.release_done = False
+        threading.Thread(
+            target=self._run_grab_sequence_thread,
+            args=(x_target, z_target),
+            daemon=True,
+        ).start()
+
+    def _run_grab_sequence_thread(self, x_target, z_target):
+        try:
+            self._execute_grab_sequence(x_target, z_target)
+        except Exception as e:
+            self.grasp_in_progress = False
+            self.grasp_done = False
+            print(f"[auto_grasp] Grasp sequence failed: {e}")
+            return
+
+        self.grasp_in_progress = False
+        self.grasp_done = True
     
     def _execute_grab_sequence(self, x_target, z_target):
         """背景執行的完整抓取流程 (結合軌跡規劃)"""

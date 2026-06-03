@@ -17,11 +17,15 @@ from nav2_msgs.action import NavigateToPose
 import rclpy
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
+import math
+import tf2_ros
 
 
 class RosCommunicator(Node):
     def __init__(self):
         super().__init__("RosCommunicator")
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # subscribeamcl_pose
         self.latest_amcl_pose = None
@@ -178,6 +182,34 @@ class RosCommunicator(Node):
         )
 
         self.marker_pub = self.create_publisher(Marker, "/clicked_point_marker", 1)
+
+    def get_tf_pose(self, parent_frame="map", child_frame="base_footprint"):
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                parent_frame,
+                child_frame,
+                rclpy.time.Time(),
+            )
+        except Exception:
+            return None
+
+        translation = transform.transform.translation
+        orientation = transform.transform.rotation
+        siny_cosp = 2.0 * (
+            orientation.w * orientation.z + orientation.x * orientation.y
+        )
+        cosy_cosp = 1.0 - 2.0 * (
+            orientation.y * orientation.y + orientation.z * orientation.z
+        )
+        yaw = math.degrees(math.atan2(siny_cosp, cosy_cosp)) % 360.0
+        return [translation.x, translation.y, yaw]
+
+    def get_tf_yaw(self, parent_frame="odom", child_frame="base_footprint"):
+        pose = self.get_tf_pose(parent_frame, child_frame)
+        if pose is None:
+            return None
+
+        return pose[2]
     
     def image_callback(self, msg):
         """接收影像並進行物體檢測"""
@@ -334,7 +366,9 @@ class RosCommunicator(Node):
         goal_pose.pose.position.x = goal[0]
         goal_pose.pose.position.y = goal[1]
         goal_pose.pose.position.z = 0.0
-        goal_pose.pose.orientation.w = 1.0
+        yaw = math.radians(goal[2]) if len(goal) > 2 else 0.0
+        goal_pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal_pose.pose.orientation.w = math.cos(yaw / 2.0)
         self.publisher_goal_pose.publish(goal_pose)
 
     # publish robot arm angle

@@ -13,6 +13,8 @@ class CarController:
         self.ros_communicator = ros_communicator
         self.nav_processing = nav_processing
         self.arm_controller = arm_controller
+        if hasattr(self.nav_processing, "set_arm_controller"):
+            self.nav_processing.set_arm_controller(arm_controller)
         # 用來管理後台執行緒的屬性
         self._auto_nav_thread = None
         self._stop_event = None
@@ -124,6 +126,7 @@ class CarController:
                 self.nav_processing.reset_mission_state()
                 self.mission_grasp_triggered = False
                 self._last_mission_log = None
+                self.reset_arm_for_mission()
             self._stop_event.clear()  # 清除之前的停止狀態
             self._auto_nav_thread = threading.Thread(
                 target=self.background_task,
@@ -134,6 +137,13 @@ class CarController:
             self._thread_running = True
 
         return False
+
+    def reset_arm_for_mission(self):
+        if self.arm_controller is None:
+            print("[mission_nav] Cannot reset arm: arm_controller is None")
+            return
+
+        self.arm_controller.reset_to_initial_pose()
 
     def stop_nav(self):
         for i in range(20):
@@ -150,6 +160,14 @@ class CarController:
             if mode == "manual_auto_nav":
                 action_key = (
                     self.nav_processing.get_action_from_nav2_plan_no_dynamic_p_2_p(
+                        goal_coordinates=None
+                    )
+                )
+                if self.nav_processing.get_finish_flag():
+                    self.nav_processing.reset_nav_process()
+            elif mode == "slam_auto_nav":
+                action_key = (
+                    self.nav_processing.get_action_from_nav2_plan_tf_p_2_p(
                         goal_coordinates=None
                     )
                 )
