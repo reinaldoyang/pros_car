@@ -32,18 +32,26 @@ class Nav2Processing:
         self.mission_state = "INIT"
         self.mission_bear_reached_announced = False
         self.mission_bear_lock_center_threshold = 50.0
-        self.return_pose = [0.084, 0.028, 178.438]
+        # self.return_pose = [0.084, 0.028, 178.438]
+        self.return_pose = [0.104, 0.125, -147.486]
         self.return_goal_published = False
         self.return_distance_announced = False
         self.return_align_announced = False
+        self.return_align_rotation_action = None
         self.return_position_threshold = 0.08
         self.return_yaw_threshold = 10.0
         self.grasp_verify_start_time = None
         self.grasp_verify_wait_time = 1.0
+
+        self.grasp_observe_window = 3.0
+        self.grasp_seen_during_window = False
+        self.grasp_success_latched = False
+
         self.grasp_verify_expected_distance = 0.288
         self.grasp_verify_distance_tolerance = 0.12
         self.grasp_verify_expected_delta_x = 26.0
         self.grasp_verify_delta_x_tolerance = 80.0
+        self.grasp_retry_requested = False
         self.drop_bear_triggered = False
         self.arm_missing_warned = False
         
@@ -69,11 +77,16 @@ class Nav2Processing:
         self.return_goal_published = False
         self.return_distance_announced = False
         self.return_align_announced = False
+        self.return_align_rotation_action = None
         self.grasp_verify_start_time = None
+        self.grasp_retry_requested = False
         self.drop_bear_triggered = False
         self.arm_missing_warned = False
         self.global_plan_msg = None
         self.index = 0
+        self.grasp_verify_start_time = None
+        self.grasp_seen_during_window = False
+        self.grasp_success_latched = False
 
     def set_arm_controller(self, arm_controller):
         self.arm_controller = arm_controller
@@ -82,6 +95,13 @@ class Nav2Processing:
         if self.mission_state != next_state:
             print(f"[mission_nav] {self.mission_state} -> {next_state}")
             self.mission_state = next_state
+
+    def consume_grasp_retry_requested(self):
+        if not self.grasp_retry_requested:
+            return False
+
+        self.grasp_retry_requested = False
+        return True
 
     def finish_nav_process(self):
         self.finishFlag = True
@@ -368,7 +388,7 @@ class Nav2Processing:
 
         # Tunable parameters
         x_threshold = 50.0
-        stop_distance = 0.4
+        stop_distance = 0.43
 
         # If target is not found, keep searching.
         # Later, in the full mission state machine, this should switch back to exploration.
@@ -470,6 +490,7 @@ class Nav2Processing:
         if distance <= self.return_position_threshold:
             self.ros_communicator.reset_nav2()
             self.return_align_announced = False
+            self.return_align_rotation_action = None
             self.set_mission_state("ALIGN_FIXED_POSE")
             return "STOP"
 
@@ -484,11 +505,17 @@ class Nav2Processing:
             self.index = 0
             self.return_goal_published = True
 
-        return self.get_action_from_nav2_plan_tf_p_2_p(
-            goal_coordinates=self.return_pose,
-            finish_distance=self.return_position_threshold,
-            mark_finished=False,
-        )
+        target_yaw = math.degrees(
+            math.atan2(return_y - current_pose[1], return_x - current_pose[0])
+        ) % 360.0
+        yaw_error = self.angle_diff_deg(target_yaw, current_pose[2])
+
+        if abs(yaw_error) <= 20.0:
+            return "FORWARD"
+        if yaw_error > 0:
+            return "COUNTERCLOCKWISE_ROTATION_SLOW"
+
+        return "CLOCKWISE_ROTATION_SLOW"
 
     def get_action_to_align_fixed_pose(self):
         current_pose = self.get_current_tf_pose_map()
@@ -508,13 +535,21 @@ class Nav2Processing:
             self.return_align_announced = True
 
         if abs(yaw_error) <= self.return_yaw_threshold:
+            self.return_align_rotation_action = None
             self.set_mission_state("DROP_BEAR")
             return "STOP"
 
-        if yaw_error > 0:
-            return "COUNTERCLOCKWISE_ROTATION_SLOW"
+        if self.return_align_rotation_action is None:
+            if yaw_error > 0:
+                self.return_align_rotation_action = "COUNTERCLOCKWISE_ROTATION_SLOW"
+            else:
+                self.return_align_rotation_action = "CLOCKWISE_ROTATION_SLOW"
+            print(
+                "[mission_nav] Fixed-pose yaw rotation locked: "
+                f"action={self.return_align_rotation_action}"
+            )
 
-        return "CLOCKWISE_ROTATION_SLOW"
+        return self.return_align_rotation_action
 
     def get_action_to_lock_center_bear(self):
         yolo_target_info = self.data_processor.get_yolo_target_info()
@@ -550,6 +585,7 @@ class Nav2Processing:
         self.return_goal_published = False
         self.return_distance_announced = False
         self.return_align_announced = False
+        self.return_align_rotation_action = None
 
     def current_yolo_matches_grasped_bear(self):
         yolo_target_info = self.data_processor.get_yolo_target_info()
@@ -575,22 +611,55 @@ class Nav2Processing:
         return found == 1 and distance_match and delta_match
 
     def get_action_to_verify_grasp(self):
-        if self.grasp_verify_start_time is None:
-            self.grasp_verify_start_time = time.time()
-            print("[mission_nav] Waiting 1.0s before grasp verification")
-            return "STOP"
-
-        if time.time() - self.grasp_verify_start_time < self.grasp_verify_wait_time:
-            return "STOP"
-
-        self.grasp_verify_start_time = None
-        if self.current_yolo_matches_grasped_bear():
-            print("[mission_nav] Grasp verified; returning to fixed pose")
+        # If the grasp has already been accepted once,
+        # never retry/release again because of unstable YOLO.
+        if self.grasp_success_latched:
+            print("[mission_nav] Grasp already latched as success; returning to fixed pose")
             self.prepare_return_to_fixed_pose()
             self.set_mission_state("RETURN_TO_FIXED_POSE")
             return "STOP"
 
-        print("[mission_nav] Grasp verification failed; retrying bear approach")
+        now = time.time()
+
+        # Start one 3-second observation window after grasp finishes.
+        if self.grasp_verify_start_time is None:
+            self.grasp_verify_start_time = now
+            self.grasp_seen_during_window = False
+            print(
+                "[mission_nav] Observing grasp for "
+                f"{self.grasp_observe_window:.1f}s"
+            )
+            return "STOP"
+
+        elapsed = now - self.grasp_verify_start_time
+
+        # During the 3-second window, if the bear is detected near the grasp pose
+        # even once, remember it. Do not release immediately on missed frames.
+        if self.current_yolo_matches_grasped_bear():
+            self.grasp_seen_during_window = True
+            print("[mission_nav] Bear seen near grasp pose during observe window")
+
+        # Keep observing until 3 seconds pass.
+        if elapsed < self.grasp_observe_window:
+            return "STOP"
+
+        # Observation window finished.
+        self.grasp_verify_start_time = None
+
+        # If bear was seen near grasp pose at least once, accept success forever.
+        if self.grasp_seen_during_window:
+            print("[mission_nav] Grasp accepted and latched; no more retry checks")
+            self.grasp_success_latched = True
+            self.grasp_seen_during_window = False
+            self.prepare_return_to_fixed_pose()
+            self.set_mission_state("RETURN_TO_FIXED_POSE")
+            return "STOP"
+
+        # Only retry if the bear was never detected near the grasp pose
+        # during the whole 3-second window.
+        print("[mission_nav] Bear not seen during observe window; retrying bear approach")
+        self.grasp_seen_during_window = False
+
         if self.arm_controller is None:
             if not self.arm_missing_warned:
                 print("[mission_nav] Cannot open gripper before retry: arm_controller is None")
@@ -601,6 +670,7 @@ class Nav2Processing:
             self.arm_controller.manual_control(0, "b")
 
         self.reset_camera_nav_state()
+        self.grasp_retry_requested = True
         self.set_mission_state("APPROACH_BEAR")
         return "STOP"
 

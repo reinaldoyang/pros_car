@@ -192,6 +192,10 @@ class CarController:
 
             elif mode == "mission_nav":
                 action_key = self.nav_processing.mission_nav()
+                if self.nav_processing.consume_grasp_retry_requested():
+                    self.mission_grasp_triggered = False
+                    print("[mission_nav] Grasp retry requested; arm trigger reset")
+
                 if (
                     self.nav_processing.mission_state == "BEAR_REACHED"
                     and not self.mission_grasp_triggered
