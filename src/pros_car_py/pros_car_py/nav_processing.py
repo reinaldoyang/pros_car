@@ -44,7 +44,7 @@ class Nav2Processing:
         self.grasp_verify_wait_time = 1.0
 
         self.grasp_confirm_required_time = 3.0
-        self.grasp_verify_timeout = 8.0
+        self.grasp_verify_timeout = 5.0
         self.grasp_match_accumulated_time = 0.0
         self.grasp_last_check_time = None
         self.grasp_success_latched = False
@@ -398,7 +398,7 @@ class Nav2Processing:
         # if found != 1:
         #     self.camera_lost_count += 1
         #     return "CLOCKWISE_ROTATION"
-        max_lost_frames = 10
+        max_lost_frames = 60
 
         if found != 1:
             self.camera_reached_count = 0
@@ -499,7 +499,7 @@ class Nav2Processing:
 
         if not self.return_goal_published:
             print(
-                "[mission_nav] Publishing fixed return goal: "
+                "[mission_nav] Publishing Nav2 fixed return goal: "
                 f"x={return_x:.3f}, y={return_y:.3f}, yaw={return_yaw:.3f}"
             )
             self.goal_published_flag = False
@@ -507,18 +507,55 @@ class Nav2Processing:
             self.global_plan_msg = None
             self.index = 0
             self.return_goal_published = True
+            if hasattr(self.ros_communicator, "clear_computed_path"):
+                self.ros_communicator.clear_computed_path()
+            if hasattr(self.ros_communicator, "request_compute_path_to_pose"):
+                path_requested = self.ros_communicator.request_compute_path_to_pose(
+                    self.return_pose
+                )
+                if not path_requested:
+                    self.return_goal_published = False
+            else:
+                self.ros_communicator.publish_goal_pose(self.return_pose)
+            return "STOP"
 
-        target_yaw = math.degrees(
-            math.atan2(return_y - current_pose[1], return_x - current_pose[0])
-        ) % 360.0
-        yaw_error = self.angle_diff_deg(target_yaw, current_pose[2])
+        if self.global_plan_msg is None:
+            if not hasattr(self.ros_communicator, "get_latest_computed_path"):
+                return "STOP"
 
-        if abs(yaw_error) <= 20.0:
+            computed_path = self.ros_communicator.get_latest_computed_path()
+            if computed_path is None:
+                return "STOP"
+
+            self.global_plan_msg = computed_path
+            self.recordFlag = 1
+            self.index = 0
+            print(
+                "[mission_nav] Following Nav2 fixed return path: "
+                f"{len(computed_path.poses)} poses"
+            )
+
+        car_x = current_pose[0]
+        car_y = current_pose[1]
+        car_yaw = current_pose[2]
+        car_position = [car_x, car_y, 0.0]
+
+        target_x, target_y = self.get_next_target_point(
+            car_position,
+            min_required_distance=0.25,
+        )
+        if target_x is None:
+            target_x = return_x
+            target_y = return_y
+
+        target_yaw = math.degrees(math.atan2(target_y - car_y, target_x - car_x)) % 360.0
+        yaw_error = self.angle_diff_deg(target_yaw, car_yaw)
+
+        if abs(yaw_error) < 20.0:
             return "FORWARD"
-        if yaw_error > 0:
-            return "COUNTERCLOCKWISE_ROTATION_SLOW"
-
-        return "CLOCKWISE_ROTATION_SLOW"
+        if yaw_error < 0.0:
+            return "CLOCKWISE_ROTATION"
+        return "COUNTERCLOCKWISE_ROTATION"
 
     def get_action_to_align_fixed_pose(self):
         current_pose = self.get_current_tf_pose_map()
@@ -567,7 +604,7 @@ class Nav2Processing:
 
         if abs(delta_x) <= self.mission_bear_lock_center_threshold:
             print(
-                "[mission_nav] Center bear locked: "
+                "[mission_nav] Nearest bear centered: "
                 f"distance={distance:.2f}, delta_x={delta_x:.1f}"
             )
             self.reset_camera_nav_state()
@@ -678,7 +715,7 @@ class Nav2Processing:
 
         self.reset_camera_nav_state()
         self.grasp_retry_requested = True
-        self.set_mission_state("APPROACH_BEAR")
+        self.set_mission_state("LOCK_CENTER_BEAR")
         return "STOP"
 
     def mission_nav(self):

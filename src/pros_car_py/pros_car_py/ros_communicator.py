@@ -13,7 +13,7 @@ from std_msgs.msg import Float32MultiArray
 from visualization_msgs.msg import Marker
 from nav2_msgs.srv import ClearEntireCostmap
 from rclpy.action import ActionClient
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import ComputePathToPose, NavigateToPose
 import rclpy
 from geometry_msgs.msg import Twist
 from cv_bridge import CvBridge
@@ -158,6 +158,12 @@ class RosCommunicator(Node):
         self.navigate_to_pose_action_client = ActionClient(
             self, NavigateToPose, "/navigate_to_pose"
         )
+        self.compute_path_to_pose_action_client = ActionClient(
+            self, ComputePathToPose, "/compute_path_to_pose"
+        )
+        self.latest_computed_path = None
+        self.compute_path_request_active = False
+        self.compute_path_last_warn_time = 0.0
 
         # ======== 在 __init__ 裡面新增 ========
         # 訂閱 YOLO 算出的目標 3D 位置 Marker
@@ -275,6 +281,7 @@ class RosCommunicator(Node):
         """
         self.clear_received_global_plan()
         self.clear_plan()
+        self.clear_computed_path()
         self.get_logger().info("Nav2 Reset Completed")
 
     # amcl_pose callback and get_latest_amcl_pose
@@ -370,6 +377,88 @@ class RosCommunicator(Node):
         goal_pose.pose.orientation.z = math.sin(yaw / 2.0)
         goal_pose.pose.orientation.w = math.cos(yaw / 2.0)
         self.publisher_goal_pose.publish(goal_pose)
+
+    def make_goal_pose_msg(self, goal):
+        goal_pose = PoseStamped()
+        goal_pose.header = Header()
+        goal_pose.header.stamp = self.get_clock().now().to_msg()
+        goal_pose.header.frame_id = "map"
+        goal_pose.pose.position.x = goal[0]
+        goal_pose.pose.position.y = goal[1]
+        goal_pose.pose.position.z = 0.0
+        yaw = math.radians(goal[2]) if len(goal) > 2 else 0.0
+        goal_pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal_pose.pose.orientation.w = math.cos(yaw / 2.0)
+        return goal_pose
+
+    def clear_computed_path(self):
+        self.latest_computed_path = None
+        self.compute_path_request_active = False
+
+    def request_compute_path_to_pose(self, goal):
+        if self.compute_path_request_active:
+            return True
+
+        if not self.compute_path_to_pose_action_client.wait_for_server(timeout_sec=0.1):
+            now = self.get_clock().now().nanoseconds / 1e9
+            if now - self.compute_path_last_warn_time > 2.0:
+                self.compute_path_last_warn_time = now
+                self.get_logger().warn("ComputePathToPose action server is not available yet.")
+            return False
+
+        self.latest_computed_path = None
+        self.compute_path_request_active = True
+
+        goal_msg = ComputePathToPose.Goal()
+        goal_msg.goal = self.make_goal_pose_msg(goal)
+        goal_msg.use_start = False
+        goal_msg.planner_id = "GridBased"
+
+        self.get_logger().info(
+            "Requesting Nav2 path to fixed pose: "
+            f"x={goal[0]:.3f}, y={goal[1]:.3f}, yaw={goal[2]:.3f}"
+        )
+        future = self.compute_path_to_pose_action_client.send_goal_async(goal_msg)
+        future.add_done_callback(self.compute_path_goal_response_callback)
+        return True
+
+    def compute_path_goal_response_callback(self, future):
+        try:
+            goal_handle = future.result()
+        except Exception as exc:
+            self.compute_path_request_active = False
+            self.get_logger().warn(f"ComputePathToPose goal request failed: {exc}")
+            return
+
+        if not goal_handle.accepted:
+            self.compute_path_request_active = False
+            self.get_logger().warn("ComputePathToPose goal was rejected.")
+            return
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self.compute_path_result_callback)
+
+    def compute_path_result_callback(self, future):
+        self.compute_path_request_active = False
+        try:
+            result = future.result().result
+        except Exception as exc:
+            self.get_logger().warn(f"ComputePathToPose result failed: {exc}")
+            return
+
+        path = result.path
+        if not path.poses:
+            self.get_logger().warn("ComputePathToPose returned an empty path.")
+            return
+
+        self.latest_computed_path = path
+        self.publisher_received_global_plan.publish(path)
+        self.publisher_plan.publish(path)
+        self.publisher_confirmed_path.publish(path)
+        self.get_logger().info(f"Received Nav2 path with {len(path.poses)} poses.")
+
+    def get_latest_computed_path(self):
+        return self.latest_computed_path
 
     # publish robot arm angle
     def publish_robot_arm_angle(self, angle):
