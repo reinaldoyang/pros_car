@@ -56,7 +56,13 @@ class Nav2Processing:
         self.grasp_retry_requested = False
         self.drop_bear_triggered = False
         self.arm_missing_warned = False
-        
+
+        # Task 3 fixed door-front pose in map frame: [x, y, yaw_deg].
+        self.door_front_pose = [2.873, 1.614, 1.849]
+        self.door_goal_published = False
+        self.door_distance_announced = False
+        self.door_position_threshold = 0.08
+        self.task3_ready_announced = False
 
     def reset_nav_process(self):
         self.finishFlag = False
@@ -90,6 +96,9 @@ class Nav2Processing:
         self.grasp_match_accumulated_time = 0.0
         self.grasp_last_check_time = None
         self.grasp_success_latched = False
+        self.door_goal_published = False
+        self.door_distance_announced = False
+        self.task3_ready_announced = False
 
     def set_arm_controller(self, arm_controller):
         self.arm_controller = arm_controller
@@ -616,6 +625,95 @@ class Nav2Processing:
             return "CLOCKWISE_ROTATION_SLOW"
 
         return "COUNTERCLOCKWISE_ROTATION_SLOW"
+    def prepare_task3_door_nav(self):
+        self.global_plan_msg = None
+        self.index = 0
+        self.goal_published_flag = False
+        self.recordFlag = 0
+        self.door_goal_published = False
+        self.door_distance_announced = False
+        self.task3_ready_announced = False
+
+    def get_action_to_door_pose(self):
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "STOP"
+
+        door_x, door_y, door_yaw = self.door_front_pose
+        distance = math.sqrt((current_pose[0] - door_x) ** 2 + (current_pose[1] - door_y) ** 2)
+
+        if not self.door_distance_announced:
+            print(f"[task3] Distance to door-front pose: {distance:.2f}")
+            self.door_distance_announced = True
+
+        if distance <= self.door_position_threshold:
+            self.ros_communicator.reset_nav2()
+            print(
+                "[task3] Reached door-front pose: "
+                f"x={door_x:.3f}, y={door_y:.3f}, yaw={door_yaw:.3f}"
+            )
+            self.set_mission_state("TASK3_READY_FOR_VISUAL_SERVO")
+            return "STOP"
+
+        if not self.door_goal_published:
+            print(
+                "[task3] Publishing Nav2 door-front goal: "
+                f"x={door_x:.3f}, y={door_y:.3f}, yaw={door_yaw:.3f}"
+            )
+            self.goal_published_flag = False
+            self.recordFlag = 0
+            self.global_plan_msg = None
+            self.index = 0
+            self.door_goal_published = True
+            if hasattr(self.ros_communicator, "clear_computed_path"):
+                self.ros_communicator.clear_computed_path()
+            if hasattr(self.ros_communicator, "request_compute_path_to_pose"):
+                path_requested = self.ros_communicator.request_compute_path_to_pose(
+                    self.door_front_pose
+                )
+                if not path_requested:
+                    self.door_goal_published = False
+            else:
+                self.ros_communicator.publish_goal_pose(self.door_front_pose)
+            return "STOP"
+
+        if self.global_plan_msg is None:
+            if not hasattr(self.ros_communicator, "get_latest_computed_path"):
+                return "STOP"
+
+            computed_path = self.ros_communicator.get_latest_computed_path()
+            if computed_path is None:
+                return "STOP"
+
+            self.global_plan_msg = computed_path
+            self.recordFlag = 1
+            self.index = 0
+            print(
+                "[task3] Following Nav2 door-front path: "
+                f"{len(computed_path.poses)} poses"
+            )
+
+        car_x = current_pose[0]
+        car_y = current_pose[1]
+        car_yaw = current_pose[2]
+        car_position = [car_x, car_y, 0.0]
+
+        target_x, target_y = self.get_next_target_point(
+            car_position,
+            min_required_distance=0.25,
+        )
+        if target_x is None:
+            target_x = door_x
+            target_y = door_y
+
+        target_yaw = math.degrees(math.atan2(target_y - car_y, target_x - car_x)) % 360.0
+        yaw_error = self.angle_diff_deg(target_yaw, car_yaw)
+
+        if abs(yaw_error) < 20.0:
+            return "FORWARD"
+        if yaw_error < 0.0:
+            return "CLOCKWISE_ROTATION"
+        return "COUNTERCLOCKWISE_ROTATION"
 
     def prepare_return_to_fixed_pose(self):
         self.global_plan_msg = None
@@ -725,7 +823,8 @@ class Nav2Processing:
         Currently implemented:
             INIT -> LOCK_CENTER_BEAR -> APPROACH_BEAR -> BEAR_REACHED -> GRASP_BEAR
                  -> VERIFY_GRASP -> RETURN_TO_FIXED_POSE -> ALIGN_FIXED_POSE
-                 -> DROP_BEAR -> DONE
+                 -> DROP_BEAR -> TASK3_NAV_TO_DOOR
+                 -> TASK3_READY_FOR_VISUAL_SERVO
         """
         if self.mission_state == "INIT":
             self.mission_bear_reached_announced = False
@@ -781,7 +880,18 @@ class Nav2Processing:
                 else:
                     self.arm_controller.manual_control(0, "b")
                 self.drop_bear_triggered = True
-                self.set_mission_state("DONE")
+                print("[mission_nav] Bear dropped; skipping Task 2 and starting Task 3 door navigation")
+                self.prepare_task3_door_nav()
+                self.set_mission_state("TASK3_NAV_TO_DOOR")
+            return "STOP"
+
+        if self.mission_state == "TASK3_NAV_TO_DOOR":
+            return self.get_action_to_door_pose()
+
+        if self.mission_state == "TASK3_READY_FOR_VISUAL_SERVO":
+            if not self.task3_ready_announced:
+                print("[task3] Ready for doorknob visual servoing placeholder")
+                self.task3_ready_announced = True
             return "STOP"
 
         if self.mission_state == "DONE":
