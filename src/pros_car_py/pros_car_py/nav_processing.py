@@ -43,8 +43,10 @@ class Nav2Processing:
         self.grasp_verify_start_time = None
         self.grasp_verify_wait_time = 1.0
 
-        self.grasp_observe_window = 3.0
-        self.grasp_seen_during_window = False
+        self.grasp_confirm_required_time = 3.0
+        self.grasp_verify_timeout = 8.0
+        self.grasp_match_accumulated_time = 0.0
+        self.grasp_last_check_time = None
         self.grasp_success_latched = False
 
         self.grasp_verify_expected_distance = 0.288
@@ -85,7 +87,8 @@ class Nav2Processing:
         self.global_plan_msg = None
         self.index = 0
         self.grasp_verify_start_time = None
-        self.grasp_seen_during_window = False
+        self.grasp_match_accumulated_time = 0.0
+        self.grasp_last_check_time = None
         self.grasp_success_latched = False
 
     def set_arm_controller(self, arm_controller):
@@ -621,44 +624,48 @@ class Nav2Processing:
 
         now = time.time()
 
-        # Start one 3-second observation window after grasp finishes.
+        # Start a verification window after grasp finishes. The bear must match
+        # the grasp-pose detection for about 3 accumulated seconds before the
+        # grasp is accepted, so a short missed YOLO frame will not force a retry.
         if self.grasp_verify_start_time is None:
             self.grasp_verify_start_time = now
-            self.grasp_seen_during_window = False
+            self.grasp_match_accumulated_time = 0.0
+            self.grasp_last_check_time = now
             print(
-                "[mission_nav] Observing grasp for "
-                f"{self.grasp_observe_window:.1f}s"
+                "[mission_nav] Verifying grasp until bear is seen near grasp pose for "
+                f"{self.grasp_confirm_required_time:.1f}s"
             )
             return "STOP"
 
         elapsed = now - self.grasp_verify_start_time
+        dt = now - self.grasp_last_check_time if self.grasp_last_check_time else 0.0
+        self.grasp_last_check_time = now
 
-        # During the 3-second window, if the bear is detected near the grasp pose
-        # even once, remember it. Do not release immediately on missed frames.
         if self.current_yolo_matches_grasped_bear():
-            self.grasp_seen_during_window = True
-            print("[mission_nav] Bear seen near grasp pose during observe window")
+            self.grasp_match_accumulated_time += max(0.0, dt)
+            print(
+                "[mission_nav] Bear still near grasp pose: "
+                f"{self.grasp_match_accumulated_time:.1f}/"
+                f"{self.grasp_confirm_required_time:.1f}s"
+            )
 
-        # Keep observing until 3 seconds pass.
-        if elapsed < self.grasp_observe_window:
-            return "STOP"
-
-        # Observation window finished.
-        self.grasp_verify_start_time = None
-
-        # If bear was seen near grasp pose at least once, accept success forever.
-        if self.grasp_seen_during_window:
+        if self.grasp_match_accumulated_time >= self.grasp_confirm_required_time:
             print("[mission_nav] Grasp accepted and latched; no more retry checks")
             self.grasp_success_latched = True
-            self.grasp_seen_during_window = False
+            self.grasp_verify_start_time = None
+            self.grasp_match_accumulated_time = 0.0
+            self.grasp_last_check_time = None
             self.prepare_return_to_fixed_pose()
             self.set_mission_state("RETURN_TO_FIXED_POSE")
             return "STOP"
 
-        # Only retry if the bear was never detected near the grasp pose
-        # during the whole 3-second window.
-        print("[mission_nav] Bear not seen during observe window; retrying bear approach")
-        self.grasp_seen_during_window = False
+        if elapsed < self.grasp_verify_timeout:
+            return "STOP"
+
+        print("[mission_nav] Grasp verification timed out; retrying bear approach")
+        self.grasp_verify_start_time = None
+        self.grasp_match_accumulated_time = 0.0
+        self.grasp_last_check_time = None
 
         if self.arm_controller is None:
             if not self.arm_missing_warned:
