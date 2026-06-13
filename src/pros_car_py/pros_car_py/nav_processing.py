@@ -30,6 +30,7 @@ class Nav2Processing:
         self.fixed_goal_replan_cooldown = 2.0
         self.fixed_goal_periodic_replan_sec = 3.0
         self.fixed_goal_last_periodic_replan_time = 0.0
+        self.fixed_goal_replan_pending = False
 
         # Visual servoing state
         self.camera_target_reached = False
@@ -77,6 +78,14 @@ class Nav2Processing:
         self.door_align_announced = False
         self.door_align_rotation_action = None
         self.task3_ready_announced = False
+        self.doorknob_target_label_published = False
+        self.doorknob_servo_reached_count = 0
+        self.doorknob_target_depth = 0.33
+        self.doorknob_depth_tolerance = 0.03
+        self.doorknob_center_threshold = 35.0
+        self.doorknob_center_slow_threshold = 80.0
+        self.doorknob_required_reached_frames = 3
+        self.task3_arm_sequence_triggered = False
 
     def reset_nav_process(self):
         self.finishFlag = False
@@ -117,6 +126,9 @@ class Nav2Processing:
         self.door_align_announced = False
         self.door_align_rotation_action = None
         self.task3_ready_announced = False
+        self.doorknob_target_label_published = False
+        self.doorknob_servo_reached_count = 0
+        self.task3_arm_sequence_triggered = False
 
     def set_arm_controller(self, arm_controller):
         self.arm_controller = arm_controller
@@ -508,6 +520,11 @@ class Nav2Processing:
         self.fixed_goal_progress_time = None
         self.fixed_goal_last_replan_time = 0.0
         self.fixed_goal_last_periodic_replan_time = time.time()
+        self.fixed_goal_replan_pending = False
+
+    def publish_yolo_target_label(self, label):
+        if hasattr(self.ros_communicator, "publish_target_label"):
+            self.ros_communicator.publish_target_label(label)
 
     def check_fixed_goal_stuck_and_replan(self, current_pose, goal_pose, goal_name, goal_flag_attr):
         now = time.time()
@@ -559,6 +576,7 @@ class Nav2Processing:
         self.fixed_goal_progress_time = now
         self.fixed_goal_last_replan_time = now
         self.fixed_goal_last_periodic_replan_time = now
+        self.fixed_goal_replan_pending = False
 
         if hasattr(self.ros_communicator, "clear_computed_path"):
             self.ros_communicator.clear_computed_path()
@@ -586,21 +604,43 @@ class Nav2Processing:
             f"[mission_nav] Refreshing {goal_name} Nav2 path after "
             f"{self.fixed_goal_periodic_replan_sec:.1f}s"
         )
-        self.global_plan_msg = None
-        self.index = 0
-        self.recordFlag = 0
         self.fixed_goal_last_periodic_replan_time = now
         self.fixed_goal_last_replan_time = now
+        self.fixed_goal_replan_pending = True
 
         if hasattr(self.ros_communicator, "clear_computed_path"):
             self.ros_communicator.clear_computed_path()
         if hasattr(self.ros_communicator, "request_compute_path_to_pose"):
-            path_requested = self.ros_communicator.request_compute_path_to_pose(goal_pose)
+            path_requested = self.ros_communicator.request_compute_path_to_pose(
+                goal_pose,
+                clear_existing_path=True,
+            )
             if not path_requested:
+                self.fixed_goal_replan_pending = False
                 setattr(self, goal_flag_attr, False)
         else:
             self.ros_communicator.publish_goal_pose(goal_pose)
             self.goal_published_flag = True
+        return True
+
+    def maybe_replace_fixed_goal_plan(self, goal_name):
+        if not self.fixed_goal_replan_pending:
+            return False
+        if not hasattr(self.ros_communicator, "get_latest_computed_path"):
+            return False
+
+        computed_path = self.ros_communicator.get_latest_computed_path()
+        if computed_path is None:
+            return False
+
+        self.global_plan_msg = computed_path
+        self.recordFlag = 1
+        self.index = 0
+        self.fixed_goal_replan_pending = False
+        print(
+            f"[mission_nav] Replaced {goal_name} path with refreshed Nav2 path: "
+            f"{len(computed_path.poses)} poses"
+        )
         return True
 
     def get_action_to_return_fixed_pose(self):
@@ -655,6 +695,11 @@ class Nav2Processing:
 
             computed_path = self.ros_communicator.get_latest_computed_path()
             if computed_path is None:
+                self.check_fixed_goal_periodic_replan(
+                    self.return_pose,
+                    "return-home navigation",
+                    "return_goal_published",
+                )
                 return "STOP"
 
             self.global_plan_msg = computed_path
@@ -665,6 +710,8 @@ class Nav2Processing:
                 f"{len(computed_path.poses)} poses"
             )
             self.reset_fixed_goal_progress()
+
+        self.maybe_replace_fixed_goal_plan("return-home navigation")
 
         if self.check_fixed_goal_stuck_and_replan(
             current_pose,
@@ -727,9 +774,9 @@ class Nav2Processing:
 
         if self.return_align_rotation_action is None:
             if yaw_error > 0:
-                self.return_align_rotation_action = "COUNTERCLOCKWISE_ROTATION_SLOW"
+                self.return_align_rotation_action = "COUNTERCLOCKWISE_ROTATION"
             else:
-                self.return_align_rotation_action = "CLOCKWISE_ROTATION_SLOW"
+                self.return_align_rotation_action = "CLOCKWISE_ROTATION"
             print(
                 "[mission_nav] Fixed-pose yaw rotation locked: "
                 f"action={self.return_align_rotation_action}"
@@ -827,6 +874,11 @@ class Nav2Processing:
 
             computed_path = self.ros_communicator.get_latest_computed_path()
             if computed_path is None:
+                self.check_fixed_goal_periodic_replan(
+                    self.door_front_pose,
+                    "Task 3 door navigation",
+                    "door_goal_published",
+                )
                 return "STOP"
 
             self.global_plan_msg = computed_path
@@ -837,6 +889,8 @@ class Nav2Processing:
                 f"{len(computed_path.poses)} poses"
             )
             self.reset_fixed_goal_progress()
+
+        self.maybe_replace_fixed_goal_plan("Task 3 door navigation")
 
         if self.check_fixed_goal_stuck_and_replan(
             current_pose,
@@ -902,20 +956,114 @@ class Nav2Processing:
                 f"y={self.door_front_pose[1]:.3f}, "
                 f"yaw={target_yaw:.3f}"
             )
+            self.doorknob_target_label_published = False
+            self.doorknob_servo_reached_count = 0
             self.set_mission_state("TASK3_READY_FOR_VISUAL_SERVO")
             return "STOP"
 
         if self.door_align_rotation_action is None:
             if yaw_error > 0:
-                self.door_align_rotation_action = "COUNTERCLOCKWISE_ROTATION_SLOW"
+                self.door_align_rotation_action = "COUNTERCLOCKWISE_ROTATION"
             else:
-                self.door_align_rotation_action = "CLOCKWISE_ROTATION_SLOW"
+                self.door_align_rotation_action = "CLOCKWISE_ROTATION"
             print(
                 "[task3] Door-front yaw rotation locked: "
                 f"action={self.door_align_rotation_action}"
             )
 
         return self.door_align_rotation_action
+
+    def get_action_to_visual_servo_doorknob(self):
+        if not self.doorknob_target_label_published:
+            # Common aliases for the same physical target. The YOLO node
+            # normalizes spaces/hyphens to underscores before matching.
+            self.publish_yolo_target_label(
+                "doorknob,door_knob,door knob,door_handle,handle,knob"
+            )
+            print("[task3] Starting doorknob visual servoing")
+            self.doorknob_target_label_published = True
+
+        yolo_target_info = self.data_processor.get_yolo_target_info()
+        if yolo_target_info is None or len(yolo_target_info) < 3:
+            self.doorknob_servo_reached_count = 0
+            return "STOP"
+
+        found = int(yolo_target_info[0])
+        distance = float(yolo_target_info[1])
+        delta_x = float(yolo_target_info[2])
+
+        if found != 1:
+            self.doorknob_servo_reached_count = 0
+            return "CLOCKWISE_ROTATION_SLOW"
+
+        valid_depth = distance > 0.0 and distance != -1.0
+        centered = abs(delta_x) <= self.doorknob_center_threshold
+        near_center = abs(delta_x) <= self.doorknob_center_slow_threshold
+
+        if not near_center:
+            self.doorknob_servo_reached_count = 0
+            if delta_x > 0.0:
+                return "CLOCKWISE_ROTATION_SLOW"
+            return "COUNTERCLOCKWISE_ROTATION_SLOW"
+
+        if valid_depth:
+            depth_error = distance - self.doorknob_target_depth
+            depth_reached = abs(depth_error) <= self.doorknob_depth_tolerance
+        else:
+            depth_error = 0.0
+            depth_reached = False
+
+        if centered and depth_reached:
+            self.doorknob_servo_reached_count += 1
+            print(
+                "[task3] Doorknob servo confirmation: "
+                f"{self.doorknob_servo_reached_count}/"
+                f"{self.doorknob_required_reached_frames}, "
+                f"distance={distance:.2f}, delta_x={delta_x:.1f}"
+            )
+            if self.doorknob_servo_reached_count >= self.doorknob_required_reached_frames:
+                print("[task3] Doorknob centered at target depth; visual servo complete")
+                self.task3_arm_sequence_triggered = False
+                self.set_mission_state("TASK3_ARM_SEQUENCE")
+            return "STOP"
+
+        self.doorknob_servo_reached_count = 0
+
+        if not centered:
+            if delta_x > 0.0:
+                return "CLOCKWISE_ROTATION_SLOW"
+            return "COUNTERCLOCKWISE_ROTATION_SLOW"
+
+        if not valid_depth:
+            return "STOP"
+
+        if depth_error > 0.0:
+            return "FORWARD_SLOW"
+
+        return "BACKWARD_SLOW"
+
+    def get_action_to_task3_arm_sequence(self):
+        if self.arm_controller is None:
+            if not self.arm_missing_warned:
+                print("[task3_arm] Cannot run door knob arm sequence: arm_controller is None")
+                self.arm_missing_warned = True
+            return "STOP"
+
+        if not self.task3_arm_sequence_triggered:
+            if hasattr(self.arm_controller, "trigger_task3_knob_sequence"):
+                print("[task3_arm] Triggering door knob arm sequence")
+                self.arm_controller.trigger_task3_knob_sequence()
+                self.task3_arm_sequence_triggered = True
+            else:
+                print("[task3_arm] Arm controller does not support door knob sequence")
+                self.set_mission_state("DONE")
+            return "STOP"
+
+        if getattr(self.arm_controller, "task3_knob_sequence_done", False):
+            print("[task3_arm] Door knob arm sequence finished")
+            self.set_mission_state("DONE")
+
+        return "STOP"
 
     def prepare_return_to_fixed_pose(self):
         self.global_plan_msg = None
@@ -927,6 +1075,8 @@ class Nav2Processing:
         self.return_align_announced = False
         self.return_align_rotation_action = None
         self.reset_fixed_goal_progress()
+        self.doorknob_target_label_published = False
+        self.doorknob_servo_reached_count = 0
 
     def current_yolo_matches_grasped_bear(self):
         yolo_target_info = self.data_processor.get_yolo_target_info()
@@ -1028,11 +1178,12 @@ class Nav2Processing:
                  -> VERIFY_GRASP -> RETURN_TO_FIXED_POSE -> ALIGN_FIXED_POSE
                  -> DROP_BEAR -> TASK3_NAV_TO_DOOR
                  -> TASK3_ALIGN_DOOR_POSE
-                 -> TASK3_READY_FOR_VISUAL_SERVO
+                 -> TASK3_READY_FOR_VISUAL_SERVO -> TASK3_ARM_SEQUENCE -> DONE
         """
         if self.mission_state == "INIT":
             self.mission_bear_reached_announced = False
             self.reset_camera_nav_state()
+            self.publish_yolo_target_label("bear")
             self.set_mission_state("LOCK_CENTER_BEAR")
             return "STOP"
 
@@ -1097,9 +1248,12 @@ class Nav2Processing:
 
         if self.mission_state == "TASK3_READY_FOR_VISUAL_SERVO":
             if not self.task3_ready_announced:
-                print("[task3] Ready for doorknob visual servoing placeholder")
+                print("[task3] Ready for doorknob visual servoing")
                 self.task3_ready_announced = True
-            return "STOP"
+            return self.get_action_to_visual_servo_doorknob()
+
+        if self.mission_state == "TASK3_ARM_SEQUENCE":
+            return self.get_action_to_task3_arm_sequence()
 
         if self.mission_state == "DONE":
             return "STOP"

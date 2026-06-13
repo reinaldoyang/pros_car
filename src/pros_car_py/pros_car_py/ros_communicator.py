@@ -3,7 +3,7 @@ from pros_car_py.car_models import DeviceDataTypeEnum, CarCControl
 from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped, Point
 from std_msgs.msg import String, Header
 from nav_msgs.msg import Path
-from sensor_msgs.msg import LaserScan, Imu, CompressedImage
+from sensor_msgs.msg import LaserScan, Imu, CompressedImage, JointState
 from trajectory_msgs.msg import JointTrajectoryPoint
 import orjson
 from pros_car_py.ros_communicator_config import ACTION_MAPPINGS
@@ -78,6 +78,11 @@ class RosCommunicator(Node):
         self.latest_imu_data = None
         self.imu_sub = self.create_subscription(
             Imu, "/imu/data", self.imu_data_callback, 10
+        )
+
+        self.latest_arm_joint_state = None
+        self.arm_joint_state_sub = self.create_subscription(
+            JointState, "/joint_states", self.arm_joint_state_callback, 10
         )
 
         self.latest_mediapipe_data = None
@@ -395,7 +400,7 @@ class RosCommunicator(Node):
         self.latest_computed_path = None
         self.compute_path_request_active = False
 
-    def request_compute_path_to_pose(self, goal):
+    def request_compute_path_to_pose(self, goal, clear_existing_path=True):
         if self.compute_path_request_active:
             return True
 
@@ -406,7 +411,8 @@ class RosCommunicator(Node):
                 self.get_logger().warn("ComputePathToPose action server is not available yet.")
             return False
 
-        self.latest_computed_path = None
+        if clear_existing_path:
+            self.latest_computed_path = None
         self.compute_path_request_active = True
 
         goal_msg = ComputePathToPose.Goal()
@@ -542,6 +548,12 @@ class RosCommunicator(Node):
 
     def imu_data_callback(self, msg):
         self.latest_imu_data = msg
+
+    def arm_joint_state_callback(self, msg):
+        self.latest_arm_joint_state = msg
+
+    def get_latest_arm_joint_state(self):
+        return self.latest_arm_joint_state
 
     def get_latest_imu_data(self):
         if self.latest_imu_data is None:

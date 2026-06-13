@@ -26,6 +26,8 @@ class ArmController:
         self.grasp_in_progress = False
         self.grasp_done = False
         self.release_done = False
+        self.task3_knob_sequence_in_progress = False
+        self.task3_knob_sequence_done = False
         
         # 建立 TF2 監聽器 (使用 ros_communicator 作為 Node)
         self.tf_buffer = tf2_ros.Buffer()
@@ -45,6 +47,10 @@ class ArmController:
         ]
         
         self.joint_angles = [joint["init"] for joint in self.joint_limits]
+        self.current_user_servo_degrees = [
+            (float(self.joint_angles[i]) * self.joint_limits[i].get("dir", 1.0)) % 360.0
+            for i in range(len(self.joint_angles))
+        ]
         self.manual_step = 3.0   
         
         print(f"🦾 Arm Controller Initialized: {len(self.joint_limits)} Joints Managed.")
@@ -155,6 +161,102 @@ class ArmController:
             f"X={x_target:.3f}, Z={z_target:.3f}"
         )
         self.start_grab_sequence(x_target, z_target)
+
+    def trigger_task3_knob_sequence(self):
+        if self.task3_knob_sequence_in_progress:
+            return
+
+        self.task3_knob_sequence_in_progress = True
+        self.task3_knob_sequence_done = False
+        threading.Thread(
+            target=self._run_task3_knob_sequence_thread,
+            daemon=True,
+        ).start()
+
+    def _run_task3_knob_sequence_thread(self):
+        try:
+            self._execute_task3_knob_sequence()
+        except Exception as e:
+            self.task3_knob_sequence_in_progress = False
+            self.task3_knob_sequence_done = False
+            print(f"[task3_arm] Door knob arm sequence failed: {e}")
+            return
+
+        self.task3_knob_sequence_in_progress = False
+        self.task3_knob_sequence_done = True
+
+    def _execute_task3_knob_sequence(self):
+        print("[task3_arm] Moving finger=0 deg, wrist=177 deg, elbow=0 deg")
+        preset = [0.0, 177.0, 0.0]
+        self._smooth_move_user_servo_degrees(preset, step=3.0, delay=0.05)
+        self._wait_for_user_servo_degrees(preset, timeout=3.0)
+        print("[task3_arm] Finger/wrist preset reached; moving elbow to 58 deg")
+        elbow_extended = [58.0, 177.0, 0.0]
+        self._smooth_move_user_servo_degrees(elbow_extended, step=2.0, delay=0.05)
+        self._wait_for_user_servo_degrees(elbow_extended, timeout=3.0)
+        print("[task3_arm] Door knob arm sequence complete")
+
+    def _smooth_move_user_servo_degrees(self, target_degrees, step=2.0, delay=0.05):
+        if not hasattr(self, "task3_user_servo_degrees"):
+            self.task3_user_servo_degrees = list(self.current_user_servo_degrees)
+
+        while True:
+            all_reached = True
+            for i, target in enumerate(target_degrees):
+                diff = target - self.task3_user_servo_degrees[i]
+                if abs(diff) <= step:
+                    self.task3_user_servo_degrees[i] = target
+                else:
+                    self.task3_user_servo_degrees[i] += step if diff > 0 else -step
+                    all_reached = False
+
+            self._publish_user_servo_degrees(self.task3_user_servo_degrees)
+            if all_reached:
+                break
+            time.sleep(delay)
+
+    def _publish_user_servo_degrees(self, degrees):
+        self.current_user_servo_degrees = list(degrees)
+        joint_pos_radians = [math.radians(float(angle)) for angle in degrees]
+        self.ros_communicator.publish_robot_arm_angle(joint_pos_radians)
+
+    def _wait_for_user_servo_degrees(self, target_degrees, timeout=3.0, tolerance=5.0):
+        start_time = time.time()
+        saw_feedback = False
+        while time.time() - start_time < timeout:
+            feedback = self._get_user_servo_feedback_degrees(len(target_degrees))
+            if feedback is None:
+                time.sleep(0.1)
+                continue
+
+            saw_feedback = True
+            if all(
+                self._angle_error_deg(actual, target) <= tolerance
+                for actual, target in zip(feedback, target_degrees)
+            ):
+                return True
+            time.sleep(0.1)
+
+        if not saw_feedback:
+            print("[task3_arm] No /joint_states feedback; using timed arm wait")
+            time.sleep(1.0)
+            return True
+
+        print("[task3_arm] Arm feedback did not reach target before timeout; continuing")
+        return False
+
+    def _get_user_servo_feedback_degrees(self, count):
+        if not hasattr(self.ros_communicator, "get_latest_arm_joint_state"):
+            return None
+
+        joint_state = self.ros_communicator.get_latest_arm_joint_state()
+        if joint_state is None or len(joint_state.position) < count:
+            return None
+
+        return [math.degrees(rad) % 360.0 for rad in joint_state.position[:count]]
+
+    def _angle_error_deg(self, actual, target):
+        return abs((actual - target + 180.0) % 360.0 - 180.0)
 
     def start_grab_sequence(self, x_target, z_target):
         self.grasp_in_progress = True
@@ -337,5 +439,8 @@ class ArmController:
         joint_pos_radians = [
             math.radians(float(self.joint_angles[i]) * self.joint_limits[i].get("dir", 1.0)) 
             for i in range(len(self.joint_angles))
+        ]
+        self.current_user_servo_degrees = [
+            math.degrees(angle) % 360.0 for angle in joint_pos_radians
         ]
         self.ros_communicator.publish_robot_arm_angle(joint_pos_radians)
