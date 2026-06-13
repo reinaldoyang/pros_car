@@ -55,5 +55,6 @@ ACTION_MAPPINGS = {
     "RIGHT_FRONT": [rotate_vel * 1.2, rotate_vel, rotate_vel * 1.2, rotate_vel],  # 右前
     "RIGHT_SHIFT": [rotate_vel, -rotate_vel, -rotate_vel, rotate_vel],
     "LEFT_SHIFT": [-rotate_vel, rotate_vel, rotate_vel, -rotate_vel],
+    "BRAKE": [0.0, 0.0, 0.0, 0.0],
     "STOP": [0.0, 0.0, 0.0, 0.0],
 }

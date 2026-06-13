@@ -115,6 +115,8 @@ class CarController:
                 self.nav_processing.reset_mission_state()
                 self.mission_grasp_triggered = False
                 self._last_mission_log = None
+            if mode == "bridge_crossing_nav":
+                self.nav_processing.reset_bridge_crossing_nav()
             action_key = "STOP"
             self.ros_communicator.publish_car_control(
                 action_key, publish_rear=True, publish_front=True
@@ -127,6 +129,8 @@ class CarController:
                 self.mission_grasp_triggered = False
                 self._last_mission_log = None
                 self.reset_arm_for_mission()
+            if mode == "bridge_crossing_nav":
+                self.nav_processing.reset_bridge_crossing_nav()
             self._stop_event.clear()  # 清除之前的停止狀態
             self._auto_nav_thread = threading.Thread(
                 target=self.background_task,
@@ -190,6 +194,9 @@ class CarController:
             elif mode == "custom_nav":
                 action_key = self.nav_processing.camera_nav()
 
+            elif mode == "bridge_crossing_nav":
+                action_key = self.nav_processing.bridge_crossing_nav()
+
             elif mode == "mission_nav":
                 action_key = self.nav_processing.mission_nav()
                 if self.nav_processing.consume_grasp_retry_requested():
@@ -206,6 +213,8 @@ class CarController:
                         print("[mission_nav] Cannot trigger grasp: arm_controller is None")
                     else:
                         print("[mission_nav] Triggering automatic arm grasp without clicked_point")
+                        if hasattr(self.nav_processing, "prepare_new_grasp_attempt"):
+                            self.nav_processing.prepare_new_grasp_attempt()
                         self.arm_controller.trigger_auto_grasp_at_base()
                     self.mission_grasp_triggered = True
 

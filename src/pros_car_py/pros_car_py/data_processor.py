@@ -1,4 +1,5 @@
 # from geometry_msgs.msg impor
+import json
 import math
 import time
 
@@ -26,6 +27,16 @@ class DataProcessor:
         if self.ros_communicator.get_latest_yolo_target_info() is not None:
             return list(self.ros_communicator.get_latest_yolo_target_info().data)
         else:
+            return None
+
+    def get_yolo_segmentation_status(self):
+        status_msg = self.ros_communicator.get_latest_yolo_segmentation_status()
+        if status_msg is None:
+            return None
+
+        try:
+            return json.loads(status_msg.data)
+        except json.JSONDecodeError:
             return None
 
     def get_camera_x_multi_depth(self):

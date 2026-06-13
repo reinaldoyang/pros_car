@@ -95,6 +95,14 @@ class RosCommunicator(Node):
             Float32MultiArray, "/yolo/target_info", self.yolo_target_info_callback, 1
         )
 
+        self.latest_yolo_segmentation_status = None
+        self.yolo_segmentation_status_sub = self.create_subscription(
+            String,
+            "/yolo/segmentation/status",
+            self.yolo_segmentation_status_callback,
+            1,
+        )
+
         self.latest_camera_x_multi_depth = None
         self.camera_x_multi_depth_sub = self.create_subscription(
             Float32MultiArray,
@@ -455,6 +463,7 @@ class RosCommunicator(Node):
         path = result.path
         if not path.poses:
             self.get_logger().warn("ComputePathToPose returned an empty path.")
+            self.latest_computed_path = path
             return
 
         self.latest_computed_path = path
@@ -498,6 +507,12 @@ class RosCommunicator(Node):
         if self.latest_yolo_target_info is None:
             return None
         return self.latest_yolo_target_info
+
+    def yolo_segmentation_status_callback(self, msg):
+        self.latest_yolo_segmentation_status = msg
+
+    def get_latest_yolo_segmentation_status(self):
+        return self.latest_yolo_segmentation_status
 
     def camera_x_multi_depth_callback(self, msg):
         self.latest_camera_x_multi_depth = msg
