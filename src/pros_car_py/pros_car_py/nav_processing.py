@@ -20,6 +20,16 @@ class Nav2Processing:
         self.index_length = 0
         self.recordFlag = 0
         self.goal_published_flag = False
+        self.fixed_goal_progress_pose = None
+        self.fixed_goal_progress_yaw = None
+        self.fixed_goal_progress_time = None
+        self.fixed_goal_last_replan_time = 0.0
+        self.fixed_goal_stuck_timeout = 5.0
+        self.fixed_goal_progress_distance = 0.03
+        self.fixed_goal_progress_yaw_degrees = 8.0
+        self.fixed_goal_replan_cooldown = 2.0
+        self.fixed_goal_periodic_replan_sec = 3.0
+        self.fixed_goal_last_periodic_replan_time = 0.0
 
         # Visual servoing state
         self.camera_target_reached = False
@@ -62,12 +72,17 @@ class Nav2Processing:
         self.door_goal_published = False
         self.door_distance_announced = False
         self.door_position_threshold = 0.08
+        self.door_yaw_threshold = 3.0
+        self.door_slow_approach_distance = 0.25
+        self.door_align_announced = False
+        self.door_align_rotation_action = None
         self.task3_ready_announced = False
 
     def reset_nav_process(self):
         self.finishFlag = False
         self.recordFlag = 0
         self.goal_published_flag = False
+        self.reset_fixed_goal_progress()
 
         self.reset_camera_nav_state()
 
@@ -92,12 +107,15 @@ class Nav2Processing:
         self.arm_missing_warned = False
         self.global_plan_msg = None
         self.index = 0
+        self.reset_fixed_goal_progress()
         self.grasp_verify_start_time = None
         self.grasp_match_accumulated_time = 0.0
         self.grasp_last_check_time = None
         self.grasp_success_latched = False
         self.door_goal_published = False
         self.door_distance_announced = False
+        self.door_align_announced = False
+        self.door_align_rotation_action = None
         self.task3_ready_announced = False
 
     def set_arm_controller(self, arm_controller):
@@ -484,6 +502,107 @@ class Nav2Processing:
     def angle_diff_deg(self, target_yaw, current_yaw):
         return (target_yaw - current_yaw + 180.0) % 360.0 - 180.0
 
+    def reset_fixed_goal_progress(self):
+        self.fixed_goal_progress_pose = None
+        self.fixed_goal_progress_yaw = None
+        self.fixed_goal_progress_time = None
+        self.fixed_goal_last_replan_time = 0.0
+        self.fixed_goal_last_periodic_replan_time = time.time()
+
+    def check_fixed_goal_stuck_and_replan(self, current_pose, goal_pose, goal_name, goal_flag_attr):
+        now = time.time()
+        current_xy = (current_pose[0], current_pose[1])
+        current_yaw = current_pose[2]
+
+        if self.fixed_goal_progress_pose is None:
+            self.fixed_goal_progress_pose = current_xy
+            self.fixed_goal_progress_yaw = current_yaw
+            self.fixed_goal_progress_time = now
+            return False
+
+        moved = math.sqrt(
+            (current_xy[0] - self.fixed_goal_progress_pose[0]) ** 2
+            + (current_xy[1] - self.fixed_goal_progress_pose[1]) ** 2
+        )
+        yaw_changed = 0.0
+        if self.fixed_goal_progress_yaw is not None:
+            yaw_changed = abs(self.angle_diff_deg(current_yaw, self.fixed_goal_progress_yaw))
+        if (
+            moved >= self.fixed_goal_progress_distance
+            or yaw_changed >= self.fixed_goal_progress_yaw_degrees
+        ):
+            self.fixed_goal_progress_pose = current_xy
+            self.fixed_goal_progress_yaw = current_yaw
+            self.fixed_goal_progress_time = now
+            return False
+
+        if self.fixed_goal_progress_time is None:
+            self.fixed_goal_progress_time = now
+            return False
+
+        stuck_time = now - self.fixed_goal_progress_time
+        replan_age = now - self.fixed_goal_last_replan_time
+        if stuck_time < self.fixed_goal_stuck_timeout:
+            return False
+        if replan_age < self.fixed_goal_replan_cooldown:
+            return False
+
+        print(
+            f"[mission_nav] {goal_name} appears stuck for {stuck_time:.1f}s; "
+            "requesting a fresh Nav2 path"
+        )
+        self.global_plan_msg = None
+        self.index = 0
+        self.recordFlag = 0
+        self.fixed_goal_progress_pose = current_xy
+        self.fixed_goal_progress_yaw = current_yaw
+        self.fixed_goal_progress_time = now
+        self.fixed_goal_last_replan_time = now
+        self.fixed_goal_last_periodic_replan_time = now
+
+        if hasattr(self.ros_communicator, "clear_computed_path"):
+            self.ros_communicator.clear_computed_path()
+        if hasattr(self.ros_communicator, "request_compute_path_to_pose"):
+            path_requested = self.ros_communicator.request_compute_path_to_pose(goal_pose)
+            if not path_requested:
+                setattr(self, goal_flag_attr, False)
+        else:
+            self.ros_communicator.publish_goal_pose(goal_pose)
+            self.goal_published_flag = True
+        return True
+
+    def check_fixed_goal_periodic_replan(self, goal_pose, goal_name, goal_flag_attr):
+        now = time.time()
+        if (
+            now - self.fixed_goal_last_periodic_replan_time
+            < self.fixed_goal_periodic_replan_sec
+        ):
+            return False
+
+        if getattr(self.ros_communicator, "compute_path_request_active", False):
+            return False
+
+        print(
+            f"[mission_nav] Refreshing {goal_name} Nav2 path after "
+            f"{self.fixed_goal_periodic_replan_sec:.1f}s"
+        )
+        self.global_plan_msg = None
+        self.index = 0
+        self.recordFlag = 0
+        self.fixed_goal_last_periodic_replan_time = now
+        self.fixed_goal_last_replan_time = now
+
+        if hasattr(self.ros_communicator, "clear_computed_path"):
+            self.ros_communicator.clear_computed_path()
+        if hasattr(self.ros_communicator, "request_compute_path_to_pose"):
+            path_requested = self.ros_communicator.request_compute_path_to_pose(goal_pose)
+            if not path_requested:
+                setattr(self, goal_flag_attr, False)
+        else:
+            self.ros_communicator.publish_goal_pose(goal_pose)
+            self.goal_published_flag = True
+        return True
+
     def get_action_to_return_fixed_pose(self):
         current_pose = self.get_current_tf_pose_map()
         if current_pose is None:
@@ -501,6 +620,7 @@ class Nav2Processing:
 
         if distance <= self.return_position_threshold:
             self.ros_communicator.reset_nav2()
+            self.reset_fixed_goal_progress()
             self.return_align_announced = False
             self.return_align_rotation_action = None
             self.set_mission_state("ALIGN_FIXED_POSE")
@@ -516,6 +636,7 @@ class Nav2Processing:
             self.global_plan_msg = None
             self.index = 0
             self.return_goal_published = True
+            self.reset_fixed_goal_progress()
             if hasattr(self.ros_communicator, "clear_computed_path"):
                 self.ros_communicator.clear_computed_path()
             if hasattr(self.ros_communicator, "request_compute_path_to_pose"):
@@ -543,6 +664,22 @@ class Nav2Processing:
                 "[mission_nav] Following Nav2 fixed return path: "
                 f"{len(computed_path.poses)} poses"
             )
+            self.reset_fixed_goal_progress()
+
+        if self.check_fixed_goal_stuck_and_replan(
+            current_pose,
+            self.return_pose,
+            "return-home navigation",
+            "return_goal_published",
+        ):
+            return "STOP"
+
+        if self.check_fixed_goal_periodic_replan(
+            self.return_pose,
+            "return-home navigation",
+            "return_goal_published",
+        ):
+            return "STOP"
 
         car_x = current_pose[0]
         car_y = current_pose[1]
@@ -632,7 +769,10 @@ class Nav2Processing:
         self.recordFlag = 0
         self.door_goal_published = False
         self.door_distance_announced = False
+        self.door_align_announced = False
+        self.door_align_rotation_action = None
         self.task3_ready_announced = False
+        self.reset_fixed_goal_progress()
 
     def get_action_to_door_pose(self):
         current_pose = self.get_current_tf_pose_map()
@@ -648,11 +788,14 @@ class Nav2Processing:
 
         if distance <= self.door_position_threshold:
             self.ros_communicator.reset_nav2()
+            self.reset_fixed_goal_progress()
             print(
-                "[task3] Reached door-front pose: "
+                "[task3] Reached door-front position: "
                 f"x={door_x:.3f}, y={door_y:.3f}, yaw={door_yaw:.3f}"
             )
-            self.set_mission_state("TASK3_READY_FOR_VISUAL_SERVO")
+            self.door_align_announced = False
+            self.door_align_rotation_action = None
+            self.set_mission_state("TASK3_ALIGN_DOOR_POSE")
             return "STOP"
 
         if not self.door_goal_published:
@@ -665,6 +808,7 @@ class Nav2Processing:
             self.global_plan_msg = None
             self.index = 0
             self.door_goal_published = True
+            self.reset_fixed_goal_progress()
             if hasattr(self.ros_communicator, "clear_computed_path"):
                 self.ros_communicator.clear_computed_path()
             if hasattr(self.ros_communicator, "request_compute_path_to_pose"):
@@ -692,6 +836,22 @@ class Nav2Processing:
                 "[task3] Following Nav2 door-front path: "
                 f"{len(computed_path.poses)} poses"
             )
+            self.reset_fixed_goal_progress()
+
+        if self.check_fixed_goal_stuck_and_replan(
+            current_pose,
+            self.door_front_pose,
+            "Task 3 door navigation",
+            "door_goal_published",
+        ):
+            return "STOP"
+
+        if self.check_fixed_goal_periodic_replan(
+            self.door_front_pose,
+            "Task 3 door navigation",
+            "door_goal_published",
+        ):
+            return "STOP"
 
         car_x = current_pose[0]
         car_y = current_pose[1]
@@ -710,10 +870,52 @@ class Nav2Processing:
         yaw_error = self.angle_diff_deg(target_yaw, car_yaw)
 
         if abs(yaw_error) < 20.0:
+            if distance <= self.door_slow_approach_distance:
+                return "FORWARD_SLOW"
             return "FORWARD"
         if yaw_error < 0.0:
             return "CLOCKWISE_ROTATION"
         return "COUNTERCLOCKWISE_ROTATION"
+
+    def get_action_to_align_door_pose(self):
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "STOP"
+
+        target_yaw = self.door_front_pose[2]
+        yaw_error = self.angle_diff_deg(target_yaw, current_pose[2])
+
+        if not self.door_align_announced:
+            print(
+                "[task3] Aligning door-front yaw: "
+                f"target_yaw={target_yaw:.1f}, "
+                f"current_yaw={current_pose[2]:.1f}, "
+                f"error={yaw_error:.1f}"
+            )
+            self.door_align_announced = True
+
+        if abs(yaw_error) <= self.door_yaw_threshold:
+            self.door_align_rotation_action = None
+            print(
+                "[task3] Reached door-front pose with yaw: "
+                f"x={self.door_front_pose[0]:.3f}, "
+                f"y={self.door_front_pose[1]:.3f}, "
+                f"yaw={target_yaw:.3f}"
+            )
+            self.set_mission_state("TASK3_READY_FOR_VISUAL_SERVO")
+            return "STOP"
+
+        if self.door_align_rotation_action is None:
+            if yaw_error > 0:
+                self.door_align_rotation_action = "COUNTERCLOCKWISE_ROTATION_SLOW"
+            else:
+                self.door_align_rotation_action = "CLOCKWISE_ROTATION_SLOW"
+            print(
+                "[task3] Door-front yaw rotation locked: "
+                f"action={self.door_align_rotation_action}"
+            )
+
+        return self.door_align_rotation_action
 
     def prepare_return_to_fixed_pose(self):
         self.global_plan_msg = None
@@ -724,6 +926,7 @@ class Nav2Processing:
         self.return_distance_announced = False
         self.return_align_announced = False
         self.return_align_rotation_action = None
+        self.reset_fixed_goal_progress()
 
     def current_yolo_matches_grasped_bear(self):
         yolo_target_info = self.data_processor.get_yolo_target_info()
@@ -824,6 +1027,7 @@ class Nav2Processing:
             INIT -> LOCK_CENTER_BEAR -> APPROACH_BEAR -> BEAR_REACHED -> GRASP_BEAR
                  -> VERIFY_GRASP -> RETURN_TO_FIXED_POSE -> ALIGN_FIXED_POSE
                  -> DROP_BEAR -> TASK3_NAV_TO_DOOR
+                 -> TASK3_ALIGN_DOOR_POSE
                  -> TASK3_READY_FOR_VISUAL_SERVO
         """
         if self.mission_state == "INIT":
@@ -887,6 +1091,9 @@ class Nav2Processing:
 
         if self.mission_state == "TASK3_NAV_TO_DOOR":
             return self.get_action_to_door_pose()
+
+        if self.mission_state == "TASK3_ALIGN_DOOR_POSE":
+            return self.get_action_to_align_door_pose()
 
         if self.mission_state == "TASK3_READY_FOR_VISUAL_SERVO":
             if not self.task3_ready_announced:
