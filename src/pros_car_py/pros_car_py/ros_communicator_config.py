@@ -12,6 +12,7 @@ vel, rotate_vel為自走車PID數值, 可於arduino程式碼查看
 speed_ratio = 50
 vel = 6.0*speed_ratio
 vel_slow = 3.0*speed_ratio
+bridge_hold_vel = 1.0*speed_ratio
 rotate_vel = 6.0*speed_ratio
 rotate_vel_slow = 5.0*speed_ratio
 rotate_vel_median = 5.5*speed_ratio
@@ -55,6 +56,7 @@ ACTION_MAPPINGS = {
     "RIGHT_FRONT": [rotate_vel * 1.2, rotate_vel, rotate_vel * 1.2, rotate_vel],  # 右前
     "RIGHT_SHIFT": [rotate_vel, -rotate_vel, -rotate_vel, rotate_vel],
     "LEFT_SHIFT": [-rotate_vel, rotate_vel, rotate_vel, -rotate_vel],
+    "BRIDGE_HOLD": [bridge_hold_vel, bridge_hold_vel, bridge_hold_vel, bridge_hold_vel],
     "BRAKE": [0.0, 0.0, 0.0, 0.0],
     "STOP": [0.0, 0.0, 0.0, 0.0],
 }

@@ -212,10 +212,13 @@ class CarController:
                     if self.arm_controller is None:
                         print("[mission_nav] Cannot trigger grasp: arm_controller is None")
                     else:
-                        print("[mission_nav] Triggering automatic arm grasp without clicked_point")
+                        print("[mission_nav] Triggering fixed joint arm grasp")
                         if hasattr(self.nav_processing, "prepare_new_grasp_attempt"):
                             self.nav_processing.prepare_new_grasp_attempt()
-                        self.arm_controller.trigger_auto_grasp_at_base()
+                        if hasattr(self.arm_controller, "trigger_joint_grasp_sequence"):
+                            self.arm_controller.trigger_joint_grasp_sequence()
+                        else:
+                            self.arm_controller.trigger_auto_grasp_at_base()
                     self.mission_grasp_triggered = True
 
             if self._thread_running == False:

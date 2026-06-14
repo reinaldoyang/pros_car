@@ -24,7 +24,7 @@ class Nav2Processing:
         self.fixed_goal_progress_yaw = None
         self.fixed_goal_progress_time = None
         self.fixed_goal_last_replan_time = 0.0
-        self.fixed_goal_stuck_timeout = 5.0
+        self.fixed_goal_stuck_timeout = 3.0
         self.fixed_goal_progress_distance = 0.03
         self.fixed_goal_progress_yaw_degrees = 8.0
         self.fixed_goal_replan_cooldown = 2.0
@@ -33,6 +33,11 @@ class Nav2Processing:
         self.fixed_goal_empty_path_direct_fallback_distance = 1.2
         self.fixed_goal_last_periodic_replan_time = 0.0
         self.fixed_goal_replan_pending = False
+        self.fixed_goal_recovery_phase = None
+        self.fixed_goal_recovery_start_time = None
+        self.fixed_goal_recovery_backup_duration = 0.8
+        self.fixed_goal_recovery_turn_duration = 0.8
+        self.fixed_goal_recovery_turn_action = "CLOCKWISE_ROTATION"
 
         # Visual servoing state
         self.camera_target_reached = False
@@ -109,6 +114,7 @@ class Nav2Processing:
         self.grasp_retry_backup_start_time = None
         self.grasp_retry_backup_duration = 0.8
         self.drop_bear_triggered = False
+        self.drop_bear_next_state = "POST_TASK1_NAV_TO_POSE"
         self.arm_missing_warned = False
 
         # Task 3 fixed door-front pose in map frame: [x, y, yaw_deg].
@@ -188,6 +194,7 @@ class Nav2Processing:
         self.grasp_retry_requested = False
         self.grasp_retry_backup_start_time = None
         self.drop_bear_triggered = False
+        self.drop_bear_next_state = "POST_TASK1_NAV_TO_POSE"
         self.arm_missing_warned = False
         self.global_plan_msg = None
         self.index = 0
@@ -547,16 +554,30 @@ class Nav2Processing:
         if not self.bridge_grasp_triggered:
             print("[bridge_crossing] Triggering bear grasp")
             self.prepare_new_grasp_attempt()
-            self.arm_controller.trigger_auto_grasp_at_base()
+            bridge_grasp_x = getattr(
+                self.arm_controller,
+                "bridge_grasp_x",
+                self.arm_controller.default_grasp_x,
+            )
+            bridge_grasp_z = getattr(
+                self.arm_controller,
+                "bridge_grasp_z",
+                self.arm_controller.default_grasp_z,
+            )
+            self.arm_controller.trigger_auto_grasp_at_base(
+                bridge_grasp_x,
+                bridge_grasp_z,
+            )
             self.bridge_grasp_triggered = True
-            return "STOP"
+            return "BRIDGE_HOLD"
 
         if self.arm_controller.grasp_done:
             print("[bridge_crossing] Grasp motion finished; verifying grasp")
             self.grasp_verify_start_time = None
             self.bridge_crossing_phase = "VERIFY_GRASP"
+            return "BRIDGE_HOLD"
 
-        return "STOP"
+        return "BRIDGE_HOLD"
 
     def get_action_to_bridge_brake_before_grasp(self):
         now = time.time()
@@ -624,7 +645,7 @@ class Nav2Processing:
             print("[bridge_crossing] Grasp already latched as success; driving forward")
             self.bridge_crossing_phase = "DRIVE_FORWARD_AFTER_GRASP"
             self.bridge_after_grasp_forward_start_time = None
-            return "STOP"
+            return "BRIDGE_HOLD"
 
         now = time.time()
         if self.grasp_verify_start_time is None:
@@ -635,7 +656,7 @@ class Nav2Processing:
                 "[bridge_crossing] Verifying grasp until bear is seen near grasp pose for "
                 f"{self.grasp_confirm_required_time:.1f}s"
             )
-            return "STOP"
+            return "BRIDGE_HOLD"
 
         elapsed = now - self.grasp_verify_start_time
         dt = now - self.grasp_last_check_time if self.grasp_last_check_time else 0.0
@@ -657,10 +678,10 @@ class Nav2Processing:
             self.grasp_last_check_time = None
             self.bridge_crossing_phase = "DRIVE_FORWARD_AFTER_GRASP"
             self.bridge_after_grasp_forward_start_time = None
-            return "STOP"
+            return "BRIDGE_HOLD"
 
         if elapsed < self.grasp_verify_timeout:
-            return "STOP"
+            return "BRIDGE_HOLD"
 
         print("[bridge_crossing] Grasp verification timed out; backing up before retry")
         self.grasp_verify_start_time = None
@@ -990,7 +1011,7 @@ class Nav2Processing:
         x_threshold = 50.0
         far_forward_x_threshold = 260.0
         final_align_distance = 0.65
-        stop_distance = 0.39
+        stop_distance = 0.41
 
         # If target is not found, keep searching.
         # Later, in the full mission state machine, this should switch back to exploration.
@@ -1094,6 +1115,17 @@ class Nav2Processing:
         self.fixed_goal_last_replan_time = 0.0
         self.fixed_goal_last_periodic_replan_time = time.time()
         self.fixed_goal_replan_pending = False
+        self.reset_fixed_goal_recovery()
+
+    def reset_fixed_goal_recovery(self):
+        self.fixed_goal_recovery_phase = None
+        self.fixed_goal_recovery_start_time = None
+
+    def use_task2_return_home_recovery(self, goal_name):
+        return (
+            goal_name == "return-home navigation"
+            and self.drop_bear_next_state == "DONE"
+        )
 
     def handle_fixed_goal_empty_path(self, goal_pose, goal_name, goal_flag_attr):
         print(
@@ -1146,6 +1178,60 @@ class Nav2Processing:
             self.ros_communicator.publish_goal_pose(goal_pose)
             self.goal_published_flag = True
 
+    def start_fixed_goal_recovery(self, current_pose, goal_name):
+        now = time.time()
+        self.fixed_goal_recovery_phase = "BACK_UP"
+        self.fixed_goal_recovery_start_time = now
+        self.fixed_goal_recovery_turn_action = (
+            "CLOCKWISE_ROTATION"
+            if int(abs(current_pose[2]) // 45.0) % 2 == 0
+            else "COUNTERCLOCKWISE_ROTATION"
+        )
+        print(
+            f"[mission_nav] {goal_name} body pose is stuck; "
+            "backing away from obstacle before replanning"
+        )
+
+    def get_fixed_goal_recovery_action(self, goal_pose, goal_name, goal_flag_attr):
+        if self.fixed_goal_recovery_phase is None:
+            return None
+
+        now = time.time()
+        if self.fixed_goal_recovery_start_time is None:
+            self.fixed_goal_recovery_start_time = now
+
+        elapsed = now - self.fixed_goal_recovery_start_time
+        if self.fixed_goal_recovery_phase == "BACK_UP":
+            if elapsed < self.fixed_goal_recovery_backup_duration:
+                return "BACKWARD"
+
+            self.fixed_goal_recovery_phase = "TURN"
+            self.fixed_goal_recovery_start_time = now
+            print(
+                "[mission_nav] Return-home recovery: rotating to leave stuck area"
+            )
+            return self.fixed_goal_recovery_turn_action
+
+        if self.fixed_goal_recovery_phase == "TURN":
+            if elapsed < self.fixed_goal_recovery_turn_duration:
+                return self.fixed_goal_recovery_turn_action
+
+            print("[mission_nav] Return-home recovery complete; requesting new path")
+            self.reset_fixed_goal_recovery()
+            self.global_plan_msg = None
+            self.index = 0
+            self.recordFlag = 0
+            self.fixed_goal_progress_pose = None
+            self.fixed_goal_progress_yaw = None
+            self.fixed_goal_progress_time = None
+            self.fixed_goal_last_replan_time = now
+            self.fixed_goal_last_periodic_replan_time = now
+            self.request_fixed_goal_replan(goal_pose, goal_flag_attr)
+            return "STOP"
+
+        self.reset_fixed_goal_recovery()
+        return None
+
     def check_fixed_goal_stuck_and_replan(self, current_pose, goal_pose, goal_name, goal_flag_attr):
         now = time.time()
         current_xy = (current_pose[0], current_pose[1])
@@ -1183,6 +1269,15 @@ class Nav2Processing:
             return False
         if replan_age < self.fixed_goal_replan_cooldown:
             return False
+
+        if self.use_task2_return_home_recovery(goal_name):
+            self.start_fixed_goal_recovery(current_pose, goal_name)
+            self.fixed_goal_progress_pose = current_xy
+            self.fixed_goal_progress_yaw = current_yaw
+            self.fixed_goal_progress_time = now
+            self.fixed_goal_last_replan_time = now
+            self.fixed_goal_last_periodic_replan_time = now
+            return True
 
         print(
             f"[mission_nav] {goal_name} appears stuck for {stuck_time:.1f}s; "
@@ -1392,6 +1487,14 @@ class Nav2Processing:
                 f"{len(computed_path.poses)} poses"
             )
             self.reset_fixed_goal_progress()
+
+        recovery_action = self.get_fixed_goal_recovery_action(
+            self.return_pose,
+            "return-home navigation",
+            "return_goal_published",
+        )
+        if recovery_action is not None:
+            return recovery_action
 
         if self.maybe_replace_fixed_goal_plan(
             "return-home navigation",
@@ -1852,8 +1955,14 @@ class Nav2Processing:
 
         action = self.bridge_crossing_nav()
         if self.bridge_crossing_phase == "DONE":
-            print("[mission_nav] Task 2 bridge pickup/down-bridge motion complete; stopping")
-            self.set_mission_state("DONE")
+            print(
+                "[mission_nav] Task 2 bridge pickup/down-bridge motion complete; "
+                "returning home to drop bear"
+            )
+            self.drop_bear_next_state = "DONE"
+            self.drop_bear_triggered = False
+            self.prepare_return_to_fixed_pose()
+            self.set_mission_state("RETURN_TO_FIXED_POSE")
             return "STOP"
 
         return action
@@ -2044,6 +2153,7 @@ class Nav2Processing:
         # never retry/release again because of unstable YOLO.
         if self.grasp_success_latched:
             print("[mission_nav] Grasp already latched as success; returning to fixed pose")
+            self.drop_bear_next_state = "POST_TASK1_NAV_TO_POSE"
             self.prepare_return_to_fixed_pose()
             self.set_mission_state("RETURN_TO_FIXED_POSE")
             return "STOP"
@@ -2081,6 +2191,7 @@ class Nav2Processing:
             self.grasp_verify_start_time = None
             self.grasp_match_accumulated_time = 0.0
             self.grasp_last_check_time = None
+            self.drop_bear_next_state = "POST_TASK1_NAV_TO_POSE"
             self.prepare_return_to_fixed_pose()
             self.set_mission_state("RETURN_TO_FIXED_POSE")
             return "STOP"
@@ -2133,7 +2244,8 @@ class Nav2Processing:
                  -> VERIFY_GRASP -> BACK_UP_AFTER_GRASP_FAIL
                  -> RETURN_TO_FIXED_POSE -> ALIGN_FIXED_POSE
                  -> DROP_BEAR -> POST_TASK1_NAV_TO_POSE
-                 -> POST_TASK1_ALIGN_POSE -> TASK2_BRIDGE_CROSSING -> DONE
+                 -> POST_TASK1_ALIGN_POSE -> TASK2_BRIDGE_CROSSING
+                 -> RETURN_TO_FIXED_POSE -> ALIGN_FIXED_POSE -> DROP_BEAR -> DONE
         """
         if self.mission_state == "INIT":
             self.reset_arm_for_mission_start()
@@ -2194,9 +2306,12 @@ class Nav2Processing:
                 else:
                     self.arm_controller.manual_control(0, "b")
                 self.drop_bear_triggered = True
-                print("[mission_nav] Bear dropped; navigating to post-Task-1 pose")
-                self.prepare_task3_door_nav()
-                self.set_mission_state("POST_TASK1_NAV_TO_POSE")
+                if self.drop_bear_next_state == "POST_TASK1_NAV_TO_POSE":
+                    print("[mission_nav] Bear dropped; navigating to post-Task-1 pose")
+                    self.prepare_task3_door_nav()
+                else:
+                    print("[mission_nav] Bear dropped; mission stopping")
+                self.set_mission_state(self.drop_bear_next_state)
             return "STOP"
 
         if self.mission_state == "POST_TASK1_NAV_TO_POSE":

@@ -21,8 +21,12 @@ class ArmController:
         self.ros_communicator = ros_communicator
         self.data_processor = data_processor
         self.target_marker = None
-        self.default_grasp_x = 0.174
-        self.default_grasp_z = -0.075
+        # self.default_grasp_x = 0.174
+        # self.default_grasp_z = -0.075
+        self.default_grasp_x = 0.14
+        self.default_grasp_z = -0.090
+        self.bridge_grasp_x = 0.170
+        self.bridge_grasp_z = -0.090
         self.grasp_in_progress = False
         self.grasp_done = False
         self.release_done = False
@@ -45,6 +49,15 @@ class ArmController:
             {"length": 0.11, "min_angle": -240, "max_angle": 0, "init": -0,   "offset": -120, "dir": -1.0},  # Joint 1 (Elbow)
             {"length": 0.00, "min_angle": 20, "max_angle": 90,  "init": 90,  "offset": 0.0, "dir": 1.0},  # Joint 2 (Gripper)
         ]
+        # Fixed joint-angle grasp target for tuning without IK.
+        # Uses internal arm angles: [Joint 0, Joint 1].
+        self.joint_grasp_target_angles = [-78.0, -179.0]
+        self.joint_grasp_return_angles = [
+            self.joint_limits[0]["init"],
+            self.joint_limits[1]["init"],
+        ]
+        self.joint_grasp_close_angle = 24
+        # self.joint_grasp_close_angle = self.joint_limits[2]["min_angle"]
         
         self.joint_angles = [joint["init"] for joint in self.joint_limits]
         self.current_user_servo_degrees = [
@@ -161,6 +174,21 @@ class ArmController:
             f"X={x_target:.3f}, Z={z_target:.3f}"
         )
         self.start_grab_sequence(x_target, z_target)
+
+    def trigger_joint_grasp_sequence(self, target_angles=None):
+        """Trigger a grasp using fixed joint angles instead of IK x/z."""
+        if target_angles is None:
+            target_angles = self.joint_grasp_target_angles
+
+        if len(target_angles) < 2:
+            print("[joint_grasp] Need target angles [joint0, joint1]")
+            return
+
+        print(
+            "[joint_grasp] Triggering fixed joint grasp "
+            f"target=[{target_angles[0]:.1f}, {target_angles[1]:.1f}]"
+        )
+        self.start_joint_grasp_sequence(target_angles[:2])
 
     def trigger_task3_knob_sequence(self):
         if self.task3_knob_sequence_in_progress:
@@ -279,6 +307,57 @@ class ArmController:
 
         self.grasp_in_progress = False
         self.grasp_done = True
+
+    def start_joint_grasp_sequence(self, target_angles):
+        self.grasp_in_progress = True
+        self.grasp_done = False
+        self.release_done = False
+        threading.Thread(
+            target=self._run_joint_grasp_sequence_thread,
+            args=(target_angles,),
+            daemon=True,
+        ).start()
+
+    def _run_joint_grasp_sequence_thread(self, target_angles):
+        try:
+            self._execute_joint_grasp_sequence(target_angles)
+        except Exception as e:
+            self.grasp_in_progress = False
+            self.grasp_done = False
+            print(f"[joint_grasp] Fixed joint grasp sequence failed: {e}")
+            return
+
+        self.grasp_in_progress = False
+        self.grasp_done = True
+
+    def _execute_joint_grasp_sequence(self, target_angles):
+        target_joint_0 = float(target_angles[0])
+        target_joint_1 = float(target_angles[1])
+
+        print("🔧 [joint 1/4] 打開夾爪...")
+        target_open = [None, None, self.joint_limits[2]["max_angle"]]
+        self._smooth_move_to(target_open, step=5.0, delay=0.1)
+        time.sleep(0.5)
+
+        print(
+            "🤖 [joint 2/4] 平滑移動至指定關節角度: "
+            f"J0={target_joint_0:.1f}, J1={target_joint_1:.1f}"
+        )
+        self._smooth_move_to([target_joint_0, target_joint_1, None], step=5.0, delay=0.1)
+        time.sleep(0.5)
+
+        print("✊ [joint 3/4] 夾取目標...")
+        target_close = [None, None, self.joint_grasp_close_angle]
+        self._smooth_move_to(target_close, step=5.0, delay=0.1)
+        time.sleep(1.0)
+
+        print("🏠 [joint 4/4] 緩慢回歸初始位置...")
+        return_joint_0 = float(self.joint_grasp_return_angles[0])
+        return_joint_1 = float(self.joint_grasp_return_angles[1])
+        self._smooth_move_to([None, return_joint_1, None], step=5.0, delay=0.1)
+        self._smooth_move_to([return_joint_0, None, None], step=5.0, delay=0.1)
+
+        print("✅ 固定關節抓取任務完成！")
     
     def _execute_grab_sequence(self, x_target, z_target):
         """背景執行的完整抓取流程 (結合軌跡規劃)"""
