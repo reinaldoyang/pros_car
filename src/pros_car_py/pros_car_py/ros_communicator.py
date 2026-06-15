@@ -177,6 +177,7 @@ class RosCommunicator(Node):
         self.latest_computed_path = None
         self.compute_path_request_active = False
         self.compute_path_last_warn_time = 0.0
+        self.compute_path_last_status = "idle"
 
         # ======== 在 __init__ 裡面新增 ========
         # 訂閱 YOLO 算出的目標 3D 位置 Marker
@@ -407,6 +408,7 @@ class RosCommunicator(Node):
     def clear_computed_path(self):
         self.latest_computed_path = None
         self.compute_path_request_active = False
+        self.compute_path_last_status = "idle"
 
     def request_compute_path_to_pose(self, goal, clear_existing_path=True):
         if self.compute_path_request_active:
@@ -421,6 +423,7 @@ class RosCommunicator(Node):
 
         if clear_existing_path:
             self.latest_computed_path = None
+            self.compute_path_last_status = "requested"
         self.compute_path_request_active = True
 
         goal_msg = ComputePathToPose.Goal()
@@ -441,11 +444,13 @@ class RosCommunicator(Node):
             goal_handle = future.result()
         except Exception as exc:
             self.compute_path_request_active = False
+            self.compute_path_last_status = "failed"
             self.get_logger().warn(f"ComputePathToPose goal request failed: {exc}")
             return
 
         if not goal_handle.accepted:
             self.compute_path_request_active = False
+            self.compute_path_last_status = "rejected"
             self.get_logger().warn("ComputePathToPose goal was rejected.")
             return
 
@@ -457,15 +462,18 @@ class RosCommunicator(Node):
         try:
             result = future.result().result
         except Exception as exc:
+            self.compute_path_last_status = "failed"
             self.get_logger().warn(f"ComputePathToPose result failed: {exc}")
             return
 
         path = result.path
         if not path.poses:
+            self.compute_path_last_status = "empty"
             self.get_logger().warn("ComputePathToPose returned an empty path.")
             self.latest_computed_path = path
             return
 
+        self.compute_path_last_status = "succeeded"
         self.latest_computed_path = path
         self.publisher_received_global_plan.publish(path)
         self.publisher_plan.publish(path)
@@ -474,6 +482,9 @@ class RosCommunicator(Node):
 
     def get_latest_computed_path(self):
         return self.latest_computed_path
+
+    def get_compute_path_last_status(self):
+        return self.compute_path_last_status
 
     # publish robot arm angle
     def publish_robot_arm_angle(self, angle):

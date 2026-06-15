@@ -6,6 +6,7 @@ from pros_car_py.nav2_utils import (
     cal_distance,
 )
 import math
+import random
 import time
 
 
@@ -38,6 +39,8 @@ class Nav2Processing:
         self.fixed_goal_recovery_backup_duration = 0.8
         self.fixed_goal_recovery_turn_duration = 0.8
         self.fixed_goal_recovery_turn_action = "CLOCKWISE_ROTATION"
+        self.return_path_rejected_recovery_start_time = None
+        self.return_path_rejected_recovery_duration = 0.8
 
         # Visual servoing state
         self.camera_target_reached = False
@@ -66,7 +69,7 @@ class Nav2Processing:
         self.bridge_drive_realign_frames = 5
         self.bridge_brake_before_grasp_duration = 0.5
         self.bridge_brake_before_grasp_start_time = None
-        self.bridge_after_grasp_forward_duration = 4.5
+        self.bridge_after_grasp_forward_duration = 5.5
         self.bridge_after_grasp_forward_start_time = None
         self.bridge_grasp_retry_backup_start_time = None
         self.bridge_grasp_retry_backup_duration = 0.8
@@ -89,18 +92,21 @@ class Nav2Processing:
         self.mission_bear_lock_center_threshold = 50.0
         # self.return_pose = [0.084, 0.028, 178.438]
         self.return_pose = [0.104, 0.125, -147.486]
+        # Intermediate waypoint to clear the bridge area before returning home.
+        self.post_bridge_intermediate_pose = [0.152, 2.891, -178.722]
         self.return_goal_published = False
         self.return_distance_announced = False
         self.return_direct_control_announced = False
         self.return_align_announced = False
         self.return_align_rotation_action = None
+        self.return_path_rejected_recovery_start_time = None
         self.return_position_threshold = 0.08
         self.return_yaw_threshold = 10.0
         self.grasp_verify_start_time = None
         self.grasp_verify_wait_time = 1.0
 
-        self.grasp_confirm_required_time = 3.0
-        self.grasp_verify_timeout = 5.0
+        self.grasp_confirm_required_time = 1.5
+        self.grasp_verify_timeout = 3.0
         self.grasp_match_accumulated_time = 0.0
         self.grasp_last_check_time = None
         self.grasp_success_latched = False
@@ -119,8 +125,17 @@ class Nav2Processing:
 
         # Task 3 fixed door-front pose in map frame: [x, y, yaw_deg].
         self.post_task1_pose = [0.894, 0.298, 88.246]
-        self.door_front_pose = [2.873, 1.614, 1.849]
+        self.door_front_pose = [3.038, 1.721, 0.318]
         self.task3_after_arm_pose = [3.808, 1.495, -28.078]
+        self.task3_final_pose = [3.732, 1.648, -21.069]
+        self.task3_final_pose_position_threshold = 0.05
+        self.task3_final_pose_last_position = None
+        self.task3_final_pose_stuck_start_time = None
+        self.task3_final_pose_recovery_start_time = None
+        self.task3_final_pose_recovery_action = None
+        self.task3_final_pose_recovery_duration = 1.5
+        self.task3_final_pose_stuck_timeout = 3.0
+        self.task3_final_pose_progress_distance = 0.03
         self.door_goal_published = False
         self.door_distance_announced = False
         self.door_direct_control_announced = False
@@ -133,13 +148,21 @@ class Nav2Processing:
         self.task3_ready_announced = False
         self.doorknob_target_label_published = False
         self.doorknob_servo_reached_count = 0
-        self.doorknob_target_depth = 0.33
+        self.doorknob_target_depth = 0.50
         self.doorknob_depth_tolerance = 0.03
+        # Positive delta_x means target is slightly right of image center.
+        # 32 px is about 5% of a 640 px image width.
+        self.doorknob_target_delta_x = 32.0
         self.doorknob_center_threshold = 35.0
         self.doorknob_center_slow_threshold = 80.0
         self.doorknob_required_reached_frames = 3
         self.doorknob_rotation_action = None
         self.task3_arm_sequence_triggered = False
+        self.task3_elbow_push_triggered = False
+        self.task3_forward_to_knob_distance = 0.16
+        self.task3_final_forward_distance = 0.08
+        self.task3_forward_start_pose = None
+        self.task3_final_forward_start_pose = None
 
     def reset_nav_process(self):
         self.finishFlag = False
@@ -190,6 +213,7 @@ class Nav2Processing:
         self.return_direct_control_announced = False
         self.return_align_announced = False
         self.return_align_rotation_action = None
+        self.return_path_rejected_recovery_start_time = None
         self.grasp_verify_start_time = None
         self.grasp_retry_requested = False
         self.grasp_retry_backup_start_time = None
@@ -213,7 +237,14 @@ class Nav2Processing:
         self.doorknob_servo_reached_count = 0
         self.doorknob_rotation_action = None
         self.task3_arm_sequence_triggered = False
+        self.task3_elbow_push_triggered = False
+        self.task3_forward_start_pose = None
+        self.task3_final_forward_start_pose = None
         self.task2_bridge_started = False
+        self.task3_final_pose_last_position = None
+        self.task3_final_pose_stuck_start_time = None
+        self.task3_final_pose_recovery_start_time = None
+        self.task3_final_pose_recovery_action = None
 
     def set_arm_controller(self, arm_controller):
         self.arm_controller = arm_controller
@@ -1122,10 +1153,50 @@ class Nav2Processing:
         self.fixed_goal_recovery_start_time = None
 
     def use_task2_return_home_recovery(self, goal_name):
+        if goal_name == "task3-final-pose":
+            return True
         return (
             goal_name == "return-home navigation"
-            and self.drop_bear_next_state == "DONE"
+            and self.drop_bear_next_state in ("DONE", "TASK3_NAV_TO_DOOR")
         )
+
+    def get_return_path_rejected_recovery_action(self):
+        if self.return_path_rejected_recovery_start_time is None:
+            return None
+
+        now = time.time()
+        elapsed = now - self.return_path_rejected_recovery_start_time
+        if elapsed < self.return_path_rejected_recovery_duration:
+            return "BACKWARD"
+
+        print("[mission_nav] Return-home backup complete; requesting Nav2 path again")
+        self.return_path_rejected_recovery_start_time = None
+        self.return_goal_published = False
+        self.global_plan_msg = None
+        self.index = 0
+        self.recordFlag = 0
+        self.reset_fixed_goal_progress()
+        if hasattr(self.ros_communicator, "clear_computed_path"):
+            self.ros_communicator.clear_computed_path()
+        return "STOP"
+
+    def maybe_start_return_path_rejected_recovery(self):
+        if not hasattr(self.ros_communicator, "get_compute_path_last_status"):
+            return False
+
+        if self.ros_communicator.get_compute_path_last_status() != "rejected":
+            return False
+
+        if self.return_path_rejected_recovery_start_time is None:
+            print(
+                "[mission_nav] ComputePathToPose return-home goal was rejected; "
+                "backing up before retrying"
+            )
+            self.return_path_rejected_recovery_start_time = time.time()
+
+        if hasattr(self.ros_communicator, "clear_computed_path"):
+            self.ros_communicator.clear_computed_path()
+        return True
 
     def handle_fixed_goal_empty_path(self, goal_pose, goal_name, goal_flag_attr):
         print(
@@ -1374,10 +1445,21 @@ class Nav2Processing:
         )
         return True
 
+    def get_action_to_post_bridge_intermediate_pose(self):
+        return self.get_action_to_task3_fixed_pose(
+            self.post_bridge_intermediate_pose,
+            "post-bridge intermediate",
+            "POST_BRIDGE_INTERMEDIATE_REACHED",
+        )
+
     def get_action_to_return_fixed_pose(self):
         current_pose = self.get_current_tf_pose_map()
         if current_pose is None:
             return "STOP"
+
+        rejected_recovery_action = self.get_return_path_rejected_recovery_action()
+        if rejected_recovery_action is not None:
+            return rejected_recovery_action
 
         return_x, return_y, return_yaw = self.return_pose
         distance = math.sqrt(
@@ -1446,6 +1528,9 @@ class Nav2Processing:
             return "STOP"
 
         if self.global_plan_msg is None:
+            if self.maybe_start_return_path_rejected_recovery():
+                return "BACKWARD"
+
             if not hasattr(self.ros_communicator, "get_latest_computed_path"):
                 return "STOP"
 
@@ -1613,6 +1698,10 @@ class Nav2Processing:
         self.door_align_rotation_action = None
         self.task3_ready_announced = False
         self.doorknob_rotation_action = None
+        self.task3_arm_sequence_triggered = False
+        self.task3_elbow_push_triggered = False
+        self.task3_forward_start_pose = None
+        self.task3_final_forward_start_pose = None
         self.reset_fixed_goal_progress()
 
     def get_action_to_task3_fixed_pose(
@@ -1716,6 +1805,14 @@ class Nav2Processing:
                 self.ros_communicator.publish_goal_pose(target_pose)
             return "STOP"
 
+        recovery_action = self.get_fixed_goal_recovery_action(
+            target_pose,
+            goal_name,
+            "door_goal_published",
+        )
+        if recovery_action is not None:
+            return recovery_action
+
         if self.global_plan_msg is None:
             if not hasattr(self.ros_communicator, "get_latest_computed_path"):
                 return "STOP"
@@ -1741,24 +1838,14 @@ class Nav2Processing:
                 return "STOP"
 
             if not computed_path.poses:
-                if direct_fallback:
-                    print(
-                        f"[task3] Empty Nav2 path for {goal_name}; "
-                        "using direct fixed-pose fallback"
-                    )
-                    if hasattr(self.ros_communicator, "clear_computed_path"):
-                        self.ros_communicator.clear_computed_path()
-                    return self.get_direct_action_to_pose(
-                        current_pose,
-                        target_pose,
-                        distance,
-                        position_threshold,
-                    )
-                return self.handle_fixed_goal_empty_path(
-                    target_pose,
-                    goal_name,
-                    "door_goal_published",
+                print(
+                    f"[task3] Empty Nav2 path for {goal_name}; "
+                    "backing up before replanning"
                 )
+                if hasattr(self.ros_communicator, "clear_computed_path"):
+                    self.ros_communicator.clear_computed_path()
+                self.start_fixed_goal_recovery(current_pose, goal_name)
+                return "STOP"
 
             self.global_plan_msg = computed_path
             self.recordFlag = 1
@@ -1957,12 +2044,12 @@ class Nav2Processing:
         if self.bridge_crossing_phase == "DONE":
             print(
                 "[mission_nav] Task 2 bridge pickup/down-bridge motion complete; "
-                "returning home to drop bear"
+                "moving to intermediate pose before returning home"
             )
-            self.drop_bear_next_state = "DONE"
+            self.drop_bear_next_state = "TASK3_NAV_TO_DOOR"
             self.drop_bear_triggered = False
-            self.prepare_return_to_fixed_pose()
-            self.set_mission_state("RETURN_TO_FIXED_POSE")
+            self.prepare_task3_door_nav()
+            self.set_mission_state("POST_BRIDGE_INTERMEDIATE")
             return "STOP"
 
         return action
@@ -2032,13 +2119,14 @@ class Nav2Processing:
             return "CLOCKWISE_ROTATION_SLOW"
 
         valid_depth = distance > 0.0 and distance != -1.0
-        centered = abs(delta_x) <= self.doorknob_center_threshold
-        near_center = abs(delta_x) <= self.doorknob_center_slow_threshold
+        delta_error = delta_x - self.doorknob_target_delta_x
+        centered = abs(delta_error) <= self.doorknob_center_threshold
+        near_center = abs(delta_error) <= self.doorknob_center_slow_threshold
 
         if not near_center:
             self.doorknob_servo_reached_count = 0
             if self.doorknob_rotation_action is None:
-                if delta_x > 0.0:
+                if delta_error > 0.0:
                     self.doorknob_rotation_action = "CLOCKWISE_ROTATION_SLOW"
                 else:
                     self.doorknob_rotation_action = "COUNTERCLOCKWISE_ROTATION_SLOW"
@@ -2060,10 +2148,12 @@ class Nav2Processing:
                 "[task3] Doorknob servo confirmation: "
                 f"{self.doorknob_servo_reached_count}/"
                 f"{self.doorknob_required_reached_frames}, "
-                f"distance={distance:.2f}, delta_x={delta_x:.1f}"
+                f"distance={distance:.2f}, delta_x={delta_x:.1f}, "
+                f"target_delta_x={self.doorknob_target_delta_x:.1f}, "
+                f"delta_error={delta_error:.1f}"
             )
             if self.doorknob_servo_reached_count >= self.doorknob_required_reached_frames:
-                print("[task3] Doorknob centered at target depth; visual servo complete")
+                print("[task3] Doorknob reached target offset/depth; starting arm sequence")
                 self.task3_arm_sequence_triggered = False
                 self.set_mission_state("TASK3_ARM_SEQUENCE")
             return "STOP"
@@ -2072,7 +2162,7 @@ class Nav2Processing:
 
         if not centered:
             if self.doorknob_rotation_action is None:
-                if delta_x > 0.0:
+                if delta_error > 0.0:
                     self.doorknob_rotation_action = "CLOCKWISE_ROTATION_SLOW"
                 else:
                     self.doorknob_rotation_action = "COUNTERCLOCKWISE_ROTATION_SLOW"
@@ -2107,10 +2197,155 @@ class Nav2Processing:
 
         if getattr(self.arm_controller, "task3_knob_sequence_done", False):
             print("[task3_arm] Door knob arm sequence finished")
-            self.prepare_task3_after_arm_nav()
-            self.set_mission_state("TASK3_NAV_AFTER_ARM")
+            self.task3_forward_start_pose = None
+            self.set_mission_state("TASK3_FORWARD_TO_KNOB")
 
         return "STOP"
+
+    def get_task3_forward_distance_moved(self, start_pose):
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None or start_pose is None:
+            return None
+
+        return math.sqrt(
+            (current_pose[0] - start_pose[0]) ** 2
+            + (current_pose[1] - start_pose[1]) ** 2
+        )
+
+    def get_action_to_task3_forward_to_knob(self):
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "STOP"
+
+        if self.task3_forward_start_pose is None:
+            self.task3_forward_start_pose = current_pose
+            print(
+                "[task3] Moving car forward toward knob: "
+                f"target_distance={self.task3_forward_to_knob_distance:.2f} m"
+            )
+            return "FORWARD_SLOW"
+
+        moved = self.get_task3_forward_distance_moved(self.task3_forward_start_pose)
+        if moved is None:
+            return "STOP"
+
+        if moved >= self.task3_forward_to_knob_distance:
+            print(
+                "[task3] Forward move toward knob complete: "
+                f"moved={moved:.2f} m"
+            )
+            self.task3_elbow_push_triggered = False
+            self.set_mission_state("TASK3_ELBOW_PUSH")
+            return "STOP"
+
+        return "FORWARD_SLOW"
+
+    def get_action_to_task3_elbow_push(self):
+        if self.arm_controller is None:
+            if not self.arm_missing_warned:
+                print("[task3_arm] Cannot run elbow push: arm_controller is None")
+                self.arm_missing_warned = True
+            return "STOP"
+
+        if not self.task3_elbow_push_triggered:
+            if hasattr(self.arm_controller, "trigger_task3_elbow_push_sequence"):
+                print("[task3_arm] Triggering door knob elbow push")
+                self.arm_controller.trigger_task3_elbow_push_sequence()
+                self.task3_elbow_push_triggered = True
+            else:
+                print("[task3_arm] Arm controller does not support elbow push")
+                self.set_mission_state("DONE")
+            return "STOP"
+
+        if getattr(self.arm_controller, "task3_elbow_push_done", False):
+            print("[task3_arm] Door knob elbow push finished")
+            self.task3_final_forward_start_pose = None
+            self.set_mission_state("TASK3_NAV_TO_FINAL_POSE")
+
+        return "STOP"
+
+    def get_action_to_task3_final_forward(self):
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "STOP"
+
+        if self.task3_final_forward_start_pose is None:
+            self.task3_final_forward_start_pose = current_pose
+            print(
+                "[task3] Moving car forward after elbow push: "
+                f"target_distance={self.task3_final_forward_distance:.2f} m"
+            )
+            return "FORWARD_SLOW"
+
+        moved = self.get_task3_forward_distance_moved(self.task3_final_forward_start_pose)
+        if moved is None:
+            return "STOP"
+
+        if moved >= self.task3_final_forward_distance:
+            print(
+                "[task3] Final door forward move complete: "
+                f"moved={moved:.2f} m"
+            )
+            self.set_mission_state("DONE")
+            return "STOP"
+
+        return "FORWARD_SLOW"
+
+    def get_action_to_task3_final_pose(self):
+        current_pose = self.get_current_tf_pose_map()
+        if current_pose is None:
+            return "FORWARD"
+
+        target_x, target_y, _ = self.task3_final_pose
+        distance = math.sqrt(
+            (current_pose[0] - target_x) ** 2
+            + (current_pose[1] - target_y) ** 2
+        )
+
+        if distance <= self.task3_final_pose_position_threshold:
+            print(f"[task3] Final pose reached: distance={distance:.3f} m")
+            self.set_mission_state("DONE")
+            return "STOP"
+
+        now = time.time()
+        current_xy = (current_pose[0], current_pose[1])
+
+        # Execute ongoing recovery if active.
+        if self.task3_final_pose_recovery_start_time is not None:
+            elapsed = now - self.task3_final_pose_recovery_start_time
+            if elapsed < self.task3_final_pose_recovery_duration:
+                return self.task3_final_pose_recovery_action
+            print("[task3] Final pose recovery done; resuming forward")
+            self.task3_final_pose_recovery_start_time = None
+            self.task3_final_pose_recovery_action = None
+            self.task3_final_pose_last_position = current_xy
+            self.task3_final_pose_stuck_start_time = now
+            return "FORWARD"
+
+        # Initialize or update stuck tracker.
+        if self.task3_final_pose_last_position is None:
+            self.task3_final_pose_last_position = current_xy
+            self.task3_final_pose_stuck_start_time = now
+        else:
+            moved = math.sqrt(
+                (current_xy[0] - self.task3_final_pose_last_position[0]) ** 2
+                + (current_xy[1] - self.task3_final_pose_last_position[1]) ** 2
+            )
+            if moved >= self.task3_final_pose_progress_distance:
+                self.task3_final_pose_last_position = current_xy
+                self.task3_final_pose_stuck_start_time = now
+            elif now - self.task3_final_pose_stuck_start_time >= self.task3_final_pose_stuck_timeout:
+                action = random.choice(
+                    ["BACKWARD", "CLOCKWISE_ROTATION", "COUNTERCLOCKWISE_ROTATION"]
+                )
+                print(f"[task3] Final pose stuck for {self.task3_final_pose_stuck_timeout:.0f}s; recovery: {action}")
+                self.task3_final_pose_recovery_action = action
+                self.task3_final_pose_recovery_start_time = now
+                self.task3_final_pose_last_position = current_xy
+                self.task3_final_pose_stuck_start_time = now
+                return action
+
+        return "FORWARD"
 
     def prepare_return_to_fixed_pose(self):
         self.global_plan_msg = None
@@ -2245,7 +2480,11 @@ class Nav2Processing:
                  -> RETURN_TO_FIXED_POSE -> ALIGN_FIXED_POSE
                  -> DROP_BEAR -> POST_TASK1_NAV_TO_POSE
                  -> POST_TASK1_ALIGN_POSE -> TASK2_BRIDGE_CROSSING
-                 -> RETURN_TO_FIXED_POSE -> ALIGN_FIXED_POSE -> DROP_BEAR -> DONE
+                 -> RETURN_TO_FIXED_POSE -> ALIGN_FIXED_POSE -> DROP_BEAR
+                 -> TASK3_NAV_TO_DOOR -> TASK3_ALIGN_DOOR_POSE
+                 -> TASK3_READY_FOR_VISUAL_SERVO -> TASK3_ARM_SEQUENCE
+                 -> TASK3_FORWARD_TO_KNOB -> TASK3_ELBOW_PUSH
+                 -> TASK3_FINAL_FORWARD -> DONE
         """
         if self.mission_state == "INIT":
             self.reset_arm_for_mission_start()
@@ -2288,6 +2527,15 @@ class Nav2Processing:
         if self.mission_state == "BACK_UP_AFTER_GRASP_FAIL":
             return self.get_action_to_back_up_after_grasp_fail()
 
+        if self.mission_state == "POST_BRIDGE_INTERMEDIATE":
+            return self.get_action_to_post_bridge_intermediate_pose()
+
+        if self.mission_state == "POST_BRIDGE_INTERMEDIATE_REACHED":
+            print("[mission_nav] Intermediate pose reached; returning home to drop bear")
+            self.prepare_return_to_fixed_pose()
+            self.set_mission_state("RETURN_TO_FIXED_POSE")
+            return "STOP"
+
         if self.mission_state == "RETURN_TO_FIXED_POSE":
             return self.get_action_to_return_fixed_pose()
 
@@ -2308,6 +2556,9 @@ class Nav2Processing:
                 self.drop_bear_triggered = True
                 if self.drop_bear_next_state == "POST_TASK1_NAV_TO_POSE":
                     print("[mission_nav] Bear dropped; navigating to post-Task-1 pose")
+                    self.prepare_task3_door_nav()
+                elif self.drop_bear_next_state == "TASK3_NAV_TO_DOOR":
+                    print("[mission_nav] Bear dropped; navigating to Task 3 door-front pose")
                     self.prepare_task3_door_nav()
                 else:
                     print("[mission_nav] Bear dropped; mission stopping")
@@ -2337,6 +2588,18 @@ class Nav2Processing:
 
         if self.mission_state == "TASK3_ARM_SEQUENCE":
             return self.get_action_to_task3_arm_sequence()
+
+        if self.mission_state == "TASK3_FORWARD_TO_KNOB":
+            return self.get_action_to_task3_forward_to_knob()
+
+        if self.mission_state == "TASK3_ELBOW_PUSH":
+            return self.get_action_to_task3_elbow_push()
+
+        if self.mission_state == "TASK3_FINAL_FORWARD":
+            return self.get_action_to_task3_final_forward()
+
+        if self.mission_state == "TASK3_NAV_TO_FINAL_POSE":
+            return self.get_action_to_task3_final_pose()
 
         if self.mission_state == "TASK3_NAV_AFTER_ARM":
             return self.get_action_to_task3_after_arm_pose()

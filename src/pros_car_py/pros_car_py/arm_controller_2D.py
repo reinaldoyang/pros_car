@@ -32,6 +32,12 @@ class ArmController:
         self.release_done = False
         self.task3_knob_sequence_in_progress = False
         self.task3_knob_sequence_done = False
+        self.task3_elbow_push_in_progress = False
+        self.task3_elbow_push_done = False
+        # User-servo degree order follows manual arm control:
+        # [elbow/submode0, wrist/submode1, finger/submode2].
+        self.task3_knob_ready_degrees = [90.0, 62.0, 1.0]
+        self.task3_knob_push_degrees = [123.0, 62.0, 1.0]
         
         # 建立 TF2 監聽器 (使用 ros_communicator 作為 Node)
         self.tf_buffer = tf2_ros.Buffer()
@@ -56,7 +62,7 @@ class ArmController:
             self.joint_limits[0]["init"],
             self.joint_limits[1]["init"],
         ]
-        self.joint_grasp_close_angle = 24
+        self.joint_grasp_close_angle = 22
         # self.joint_grasp_close_angle = self.joint_limits[2]["min_angle"]
         
         self.joint_angles = [joint["init"] for joint in self.joint_limits]
@@ -214,15 +220,47 @@ class ArmController:
         self.task3_knob_sequence_done = True
 
     def _execute_task3_knob_sequence(self):
-        print("[task3_arm] Moving finger=0 deg, wrist=177 deg, elbow=0 deg")
-        preset = [0.0, 177.0, 0.0]
-        self._smooth_move_user_servo_degrees(preset, step=3.0, delay=0.05)
-        self._wait_for_user_servo_degrees(preset, timeout=3.0)
-        print("[task3_arm] Finger/wrist preset reached; moving elbow to 58 deg")
-        elbow_extended = [58.0, 177.0, 0.0]
-        self._smooth_move_user_servo_degrees(elbow_extended, step=2.0, delay=0.05)
-        self._wait_for_user_servo_degrees(elbow_extended, timeout=3.0)
-        print("[task3_arm] Door knob arm sequence complete")
+        target = self.task3_knob_ready_degrees
+        print(
+            "[task3_arm] Moving to knob ready pose: "
+            f"elbow={target[0]:.1f}, wrist={target[1]:.1f}, finger={target[2]:.1f}"
+        )
+        self._smooth_move_user_servo_degrees(target, step=3.0, delay=0.05)
+        self._wait_for_user_servo_degrees(target, timeout=3.0)
+        print("[task3_arm] Door knob ready pose reached")
+
+    def trigger_task3_elbow_push_sequence(self):
+        if self.task3_elbow_push_in_progress:
+            return
+
+        self.task3_elbow_push_in_progress = True
+        self.task3_elbow_push_done = False
+        threading.Thread(
+            target=self._run_task3_elbow_push_sequence_thread,
+            daemon=True,
+        ).start()
+
+    def _run_task3_elbow_push_sequence_thread(self):
+        try:
+            self._execute_task3_elbow_push_sequence()
+        except Exception as e:
+            self.task3_elbow_push_in_progress = False
+            self.task3_elbow_push_done = False
+            print(f"[task3_arm] Door knob elbow push failed: {e}")
+            return
+
+        self.task3_elbow_push_in_progress = False
+        self.task3_elbow_push_done = True
+
+    def _execute_task3_elbow_push_sequence(self):
+        target = self.task3_knob_push_degrees
+        print(
+            "[task3_arm] Moving elbow for knob push: "
+            f"elbow={target[0]:.1f}, wrist={target[1]:.1f}, finger={target[2]:.1f}"
+        )
+        self._smooth_move_user_servo_degrees(target, step=2.0, delay=0.05)
+        self._wait_for_user_servo_degrees(target, timeout=3.0)
+        print("[task3_arm] Door knob elbow push pose reached")
 
     def _smooth_move_user_servo_degrees(self, target_degrees, step=2.0, delay=0.05):
         if not hasattr(self, "task3_user_servo_degrees"):

@@ -87,5 +87,7 @@ class NavigationActionServer(Node):
             return self.nav_controller.manual_nav
         elif mode == "Customize_Nav":
             return self.nav_controller.customize_nav
+        elif mode == "Post_Bridge_Nav":
+            return self.nav_controller.post_bridge_nav
         else:
             self.get_logger().error(f"Unknown mode requested: {mode}")  # Log error here
